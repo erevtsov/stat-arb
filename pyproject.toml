@@ -1,0 +1,25 @@
+[project]
+name = "claude-stat-arb"
+version = "0.1.0"
+description = "Statistical arbitrage trading system for US equities using intraday mean-reversion pairs strategy"
+requires-python = ">=3.11"
+dependencies = [
+    "polars>=0.20.0",
+    "statsmodels>=0.14.0",
+    "requests>=2.31.0",
+    "tqdm>=4.66.0",
+    "plotly>=5.18.0",
+    "matplotlib>=3.8.0",
+    "jupyter>=1.0.0",
+    "nbformat>=5.9.0",
+    "pyarrow>=14.0.0",
+]
+
+[project.scripts]
+fetch-data = "scripts.fetch_data:main"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
