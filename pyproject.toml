@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "claude-stat-arb"
 version = "0.1.0"
@@ -17,6 +21,9 @@ dependencies = [
 
 [project.scripts]
 fetch-data = "scripts.fetch_data:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["analysis", "strategy", "utils", "scripts"]
 
 [tool.uv]
 dev-dependencies = [
