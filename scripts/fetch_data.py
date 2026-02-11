@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 from datetime import datetime, timedelta
@@ -30,12 +31,12 @@ from tqdm import tqdm
 # Configuration – edit EODHD_API_KEY before running
 # ──────────────────────────────────────────────────────────────────────
 CONFIG = {
-    "EODHD_API_KEY": "your_key_here",  # <-- replace with your key
+    "EODHD_API_KEY": os.environ["EODHD_KEY"],  # <-- replace with your key
     "start_date": "2024-01-01",
     "end_date": "2024-12-31",
     "exchange": "US",
-    "intraday_chunk_days": 120,   # EODHD max per intraday request
-    "request_delay": 0.35,        # seconds between API calls
+    "intraday_chunk_days": 120,  # EODHD max per intraday request
+    "request_delay": 0.35,  # seconds between API calls
     "base_url": "https://eodhd.com/api",
 }
 
@@ -43,6 +44,7 @@ CONFIG = {
 # ──────────────────────────────────────────────────────────────────────
 # Logging helper
 # ──────────────────────────────────────────────────────────────────────
+
 
 def _log(msg: str, log_path: Path | None = None) -> None:
     """Print to console and optionally append to log file."""
@@ -58,8 +60,11 @@ def _log(msg: str, log_path: Path | None = None) -> None:
 # Date helpers
 # ──────────────────────────────────────────────────────────────────────
 
+
 def _date_chunks(
-    start: str, end: str, chunk_days: int,
+    start: str,
+    end: str,
+    chunk_days: int,
 ) -> list[tuple[str, str]]:
     """Split a date range into consecutive chunks of at most *chunk_days*."""
     fmt = "%Y-%m-%d"
@@ -77,6 +82,7 @@ def _date_chunks(
 # Generic request wrapper with retry
 # ──────────────────────────────────────────────────────────────────────
 
+
 def _api_get(url: str, timeout: int = 30, retries: int = 3) -> requests.Response | None:
     """GET with exponential-backoff retries on transient failures."""
     for attempt in range(retries):
@@ -93,6 +99,7 @@ def _api_get(url: str, timeout: int = 30, retries: int = 3) -> requests.Response
 # ──────────────────────────────────────────────────────────────────────
 # 1. Intraday 1-min bars
 # ──────────────────────────────────────────────────────────────────────
+
 
 def fetch_1min_chunk(
     ticker: str,
@@ -133,7 +140,9 @@ def fetch_1min_chunk(
     if df["timestamp"].dtype == pl.Utf8:
         df = df.with_columns(pl.col("timestamp").str.to_datetime().alias("timestamp"))
     elif df["timestamp"].dtype in (pl.Int64, pl.UInt64, pl.Float64):
-        df = df.with_columns(pl.from_epoch(pl.col("timestamp"), time_unit="s").alias("timestamp"))
+        df = df.with_columns(
+            pl.from_epoch(pl.col("timestamp"), time_unit="s").alias("timestamp")
+        )
 
     keep = ["timestamp", "open", "high", "low", "close", "volume"]
     df = df.select([c for c in keep if c in df.columns])
@@ -160,7 +169,7 @@ def fetch_intraday_ticker(
     chunks = _date_chunks(start_date, end_date, chunk_days)
     frames: list[pl.DataFrame] = []
     for i, (cs, ce) in enumerate(chunks):
-        _log(f"  {ticker} 1min: chunk {i+1}/{len(chunks)}  {cs} -> {ce}", log_path)
+        _log(f"  {ticker} 1min: chunk {i + 1}/{len(chunks)}  {cs} -> {ce}", log_path)
         df = fetch_1min_chunk(ticker, cs, ce, api_key, exchange)
         if df is not None:
             frames.append(df)
@@ -175,6 +184,7 @@ def fetch_intraday_ticker(
 # ──────────────────────────────────────────────────────────────────────
 # 2. Daily EOD bars
 # ──────────────────────────────────────────────────────────────────────
+
 
 def fetch_eod_ticker(
     ticker: str,
@@ -224,6 +234,7 @@ def fetch_eod_ticker(
 # 3. Splits
 # ──────────────────────────────────────────────────────────────────────
 
+
 def fetch_splits_ticker(
     ticker: str,
     start_date: str,
@@ -263,6 +274,7 @@ def fetch_splits_ticker(
 # ──────────────────────────────────────────────────────────────────────
 # 4. Dividends
 # ──────────────────────────────────────────────────────────────────────
+
 
 def fetch_dividends_ticker(
     ticker: str,
@@ -304,6 +316,7 @@ def fetch_dividends_ticker(
 # Orchestrator
 # ──────────────────────────────────────────────────────────────────────
 
+
 def _save_if_present(
     df: pl.DataFrame | None,
     out_path: Path,
@@ -321,10 +334,16 @@ def _save_if_present(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch EODHD data")
-    parser.add_argument("--eod-only", action="store_true",
-                        help="Skip intraday, fetch only EOD + splits + dividends")
-    parser.add_argument("--intraday-only", action="store_true",
-                        help="Skip EOD/splits/dividends, fetch only 1-min bars")
+    parser.add_argument(
+        "--eod-only",
+        action="store_true",
+        help="Skip intraday, fetch only EOD + splits + dividends",
+    )
+    parser.add_argument(
+        "--intraday-only",
+        action="store_true",
+        help="Skip EOD/splits/dividends, fetch only 1-min bars",
+    )
     args = parser.parse_args()
 
     api_key = CONFIG["EODHD_API_KEY"]
@@ -335,6 +354,7 @@ def main() -> None:
     # Import universe from central config
     try:
         from utils.config import get_all_tickers
+
         universe = get_all_tickers()
     except ImportError:
         print("ERROR: Could not import universe from utils.config.")
@@ -384,7 +404,9 @@ def main() -> None:
             if split_file.exists():
                 _log(f"  {ticker} splits: SKIP (exists)", log_path)
             else:
-                df = fetch_splits_ticker(ticker, start_date, end_date, api_key, exchange)
+                df = fetch_splits_ticker(
+                    ticker, start_date, end_date, api_key, exchange
+                )
                 _save_if_present(df, split_file, ticker, "splits", log_path)
                 time.sleep(delay)
 
@@ -393,7 +415,9 @@ def main() -> None:
             if div_file.exists():
                 _log(f"  {ticker} divs: SKIP (exists)", log_path)
             else:
-                df = fetch_dividends_ticker(ticker, start_date, end_date, api_key, exchange)
+                df = fetch_dividends_ticker(
+                    ticker, start_date, end_date, api_key, exchange
+                )
                 _save_if_present(df, div_file, ticker, "divs", log_path)
                 time.sleep(delay)
 
@@ -404,8 +428,14 @@ def main() -> None:
                 _log(f"  {ticker} 1min: SKIP (exists)", log_path)
             else:
                 df = fetch_intraday_ticker(
-                    ticker, start_date, end_date, api_key,
-                    exchange, chunk_days, delay, log_path,
+                    ticker,
+                    start_date,
+                    end_date,
+                    api_key,
+                    exchange,
+                    chunk_days,
+                    delay,
+                    log_path,
                 )
                 _save_if_present(df, intra_file, ticker, "1min", log_path)
                 time.sleep(delay)
