@@ -14,6 +14,7 @@ Usage:
     uv run python scripts/fetch_data.py              # fetch everything
     uv run python scripts/fetch_data.py --eod-only   # daily + splits + divs only
     uv run python scripts/fetch_data.py --intraday-only
+    uv run python scripts/fetch_data.py --force       # re-fetch and overwrite all
 """
 
 import argparse
@@ -31,8 +32,8 @@ from tqdm import tqdm
 # Configuration – edit EODHD_API_KEY before running
 # ──────────────────────────────────────────────────────────────────────
 CONFIG = {
-    "EODHD_API_KEY": os.environ["EODHD_KEY"],  # <-- replace with your key
-    "start_date": "2024-01-01",
+    "EODHD_API_KEY": os.environ.get("EODHD_KEY", "your_key_here"),
+    "start_date": "2023-01-01",
     "end_date": "2024-12-31",
     "exchange": "US",
     "intraday_chunk_days": 120,  # EODHD max per intraday request
@@ -344,6 +345,11 @@ def main() -> None:
         action="store_true",
         help="Skip EOD/splits/dividends, fetch only 1-min bars",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-fetch and overwrite existing data files",
+    )
     args = parser.parse_args()
 
     api_key = CONFIG["EODHD_API_KEY"]
@@ -381,10 +387,12 @@ def main() -> None:
 
     do_intraday = not args.eod_only
     do_eod = not args.intraday_only
+    force = args.force
 
     _log(
         f"Starting fetch: {len(universe)} tickers, {start_date} to {end_date} "
-        f"[intraday={'Y' if do_intraday else 'N'}, eod={'Y' if do_eod else 'N'}]",
+        f"[intraday={'Y' if do_intraday else 'N'}, eod={'Y' if do_eod else 'N'}, "
+        f"force={'Y' if force else 'N'}]",
         log_path,
     )
 
@@ -392,7 +400,7 @@ def main() -> None:
         # ── EOD daily ──────────────────────────────────────
         if do_eod:
             eod_file = eod_dir / f"{ticker}.parquet"
-            if eod_file.exists():
+            if eod_file.exists() and not force:
                 _log(f"  {ticker} eod: SKIP (exists)", log_path)
             else:
                 df = fetch_eod_ticker(ticker, start_date, end_date, api_key, exchange)
@@ -401,7 +409,7 @@ def main() -> None:
 
             # ── Splits ─────────────────────────────────────
             split_file = splits_dir / f"{ticker}.parquet"
-            if split_file.exists():
+            if split_file.exists() and not force:
                 _log(f"  {ticker} splits: SKIP (exists)", log_path)
             else:
                 df = fetch_splits_ticker(
@@ -412,7 +420,7 @@ def main() -> None:
 
             # ── Dividends ──────────────────────────────────
             div_file = div_dir / f"{ticker}.parquet"
-            if div_file.exists():
+            if div_file.exists() and not force:
                 _log(f"  {ticker} divs: SKIP (exists)", log_path)
             else:
                 df = fetch_dividends_ticker(
@@ -424,7 +432,7 @@ def main() -> None:
         # ── Intraday 1-min ─────────────────────────────────
         if do_intraday:
             intra_file = intraday_dir / f"{ticker}.parquet"
-            if intra_file.exists():
+            if intra_file.exists() and not force:
                 _log(f"  {ticker} 1min: SKIP (exists)", log_path)
             else:
                 df = fetch_intraday_ticker(
