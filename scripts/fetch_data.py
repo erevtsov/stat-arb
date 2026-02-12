@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone data fetching script for EODHD API.
+Standalone multi-threaded data fetching script for EODHD API.
 
 Downloads four datasets per ticker and saves to Parquet:
   1. 1-minute intraday bars  -> data/raw/1min/{TICKER}.parquet
@@ -11,16 +11,19 @@ Downloads four datasets per ticker and saves to Parquet:
 EODHD plan assumed: EOD+Intraday All World Extended.
 
 Usage:
-    uv run python scripts/fetch_data.py              # fetch everything
-    uv run python scripts/fetch_data.py --eod-only   # daily + splits + divs only
-    uv run python scripts/fetch_data.py --intraday-only
-    uv run python scripts/fetch_data.py --force       # re-fetch and overwrite all
+    uv run python scripts/fetch_data.py                    # fetch everything (5 workers)
+    uv run python scripts/fetch_data.py --eod-only         # daily + splits + divs only
+    uv run python scripts/fetch_data.py --intraday-only    # intraday 1-min bars only
+    uv run python scripts/fetch_data.py --force            # re-fetch and overwrite all
+    uv run python scripts/fetch_data.py --workers 10       # use 10 concurrent threads
 """
 
 import argparse
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -37,9 +40,13 @@ CONFIG = {
     "end_date": "2024-12-31",
     "exchange": "US",
     "intraday_chunk_days": 120,  # EODHD max per intraday request
-    "request_delay": 0.35,  # seconds between API calls
+    "request_delay": 0.1,  # seconds between API calls
     "base_url": "https://eodhd.com/api",
+    "max_workers": 5,  # number of concurrent threads for fetching
 }
+
+# Thread-safe logging lock
+_log_lock = threading.Lock()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -48,13 +55,14 @@ CONFIG = {
 
 
 def _log(msg: str, log_path: Path | None = None) -> None:
-    """Print to console and optionally append to log file."""
+    """Print to console and optionally append to log file (thread-safe)."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
-    print(line)
-    if log_path is not None:
-        with open(log_path, "a") as f:
-            f.write(line + "\n")
+    with _log_lock:
+        print(line)
+        if log_path is not None:
+            with open(log_path, "a") as f:
+                f.write(line + "\n")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -136,7 +144,7 @@ def fetch_1min_chunk(
 
     # Normalise timestamp column name
     if "datetime" in df.columns:
-        df = df.rename({"datetime": "timestamp"})
+        df = df.drop(["timestamp"]).rename({"datetime": "timestamp"})
 
     if df["timestamp"].dtype == pl.Utf8:
         df = df.with_columns(pl.col("timestamp").str.to_datetime().alias("timestamp"))
@@ -333,6 +341,74 @@ def _save_if_present(
     _log(f"  {ticker} {label}: {len(df)} rows -> {out_path}", log_path)
 
 
+def process_ticker(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    api_key: str,
+    exchange: str,
+    chunk_days: int,
+    delay: float,
+    do_intraday: bool,
+    do_eod: bool,
+    force: bool,
+    intraday_dir: Path,
+    eod_dir: Path,
+    splits_dir: Path,
+    div_dir: Path,
+    log_path: Path,
+) -> str:
+    """Process all data types for a single ticker. Returns ticker name when done."""
+    # ── EOD daily ──────────────────────────────────────
+    if do_eod:
+        eod_file = eod_dir / f"{ticker}.parquet"
+        if eod_file.exists() and not force:
+            _log(f"  {ticker} eod: SKIP (exists)", log_path)
+        else:
+            df = fetch_eod_ticker(ticker, start_date, end_date, api_key, exchange)
+            _save_if_present(df, eod_file, ticker, "eod", log_path)
+            time.sleep(delay)
+
+        # ── Splits ─────────────────────────────────────
+        split_file = splits_dir / f"{ticker}.parquet"
+        if split_file.exists() and not force:
+            _log(f"  {ticker} splits: SKIP (exists)", log_path)
+        else:
+            df = fetch_splits_ticker(ticker, start_date, end_date, api_key, exchange)
+            _save_if_present(df, split_file, ticker, "splits", log_path)
+            time.sleep(delay)
+
+        # ── Dividends ──────────────────────────────────
+        div_file = div_dir / f"{ticker}.parquet"
+        if div_file.exists() and not force:
+            _log(f"  {ticker} divs: SKIP (exists)", log_path)
+        else:
+            df = fetch_dividends_ticker(ticker, start_date, end_date, api_key, exchange)
+            _save_if_present(df, div_file, ticker, "divs", log_path)
+            time.sleep(delay)
+
+    # ── Intraday 1-min ─────────────────────────────────
+    if do_intraday:
+        intra_file = intraday_dir / f"{ticker}.parquet"
+        if intra_file.exists() and not force:
+            _log(f"  {ticker} 1min: SKIP (exists)", log_path)
+        else:
+            df = fetch_intraday_ticker(
+                ticker,
+                start_date,
+                end_date,
+                api_key,
+                exchange,
+                chunk_days,
+                delay,
+                log_path,
+            )
+            _save_if_present(df, intra_file, ticker, "1min", log_path)
+            time.sleep(delay)
+
+    return ticker
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fetch EODHD data")
     parser.add_argument(
@@ -349,6 +425,12 @@ def main() -> None:
         "--force",
         action="store_true",
         help="Re-fetch and overwrite existing data files",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=CONFIG["max_workers"],
+        help=f"Number of concurrent worker threads (default: {CONFIG['max_workers']})",
     )
     args = parser.parse_args()
 
@@ -388,65 +470,50 @@ def main() -> None:
     do_intraday = not args.eod_only
     do_eod = not args.intraday_only
     force = args.force
+    max_workers = args.workers
 
     _log(
         f"Starting fetch: {len(universe)} tickers, {start_date} to {end_date} "
         f"[intraday={'Y' if do_intraday else 'N'}, eod={'Y' if do_eod else 'N'}, "
-        f"force={'Y' if force else 'N'}]",
+        f"force={'Y' if force else 'N'}, workers={max_workers}]",
         log_path,
     )
 
-    for ticker in tqdm(universe, desc="Fetching"):
-        # ── EOD daily ──────────────────────────────────────
-        if do_eod:
-            eod_file = eod_dir / f"{ticker}.parquet"
-            if eod_file.exists() and not force:
-                _log(f"  {ticker} eod: SKIP (exists)", log_path)
-            else:
-                df = fetch_eod_ticker(ticker, start_date, end_date, api_key, exchange)
-                _save_if_present(df, eod_file, ticker, "eod", log_path)
-                time.sleep(delay)
+    # Use ThreadPoolExecutor for concurrent fetching
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all ticker processing tasks
+        futures = {
+            executor.submit(
+                process_ticker,
+                ticker,
+                start_date,
+                end_date,
+                api_key,
+                exchange,
+                chunk_days,
+                delay,
+                do_intraday,
+                do_eod,
+                force,
+                intraday_dir,
+                eod_dir,
+                splits_dir,
+                div_dir,
+                log_path,
+            ): ticker
+            for ticker in universe
+        }
 
-            # ── Splits ─────────────────────────────────────
-            split_file = splits_dir / f"{ticker}.parquet"
-            if split_file.exists() and not force:
-                _log(f"  {ticker} splits: SKIP (exists)", log_path)
-            else:
-                df = fetch_splits_ticker(
-                    ticker, start_date, end_date, api_key, exchange
-                )
-                _save_if_present(df, split_file, ticker, "splits", log_path)
-                time.sleep(delay)
-
-            # ── Dividends ──────────────────────────────────
-            div_file = div_dir / f"{ticker}.parquet"
-            if div_file.exists() and not force:
-                _log(f"  {ticker} divs: SKIP (exists)", log_path)
-            else:
-                df = fetch_dividends_ticker(
-                    ticker, start_date, end_date, api_key, exchange
-                )
-                _save_if_present(df, div_file, ticker, "divs", log_path)
-                time.sleep(delay)
-
-        # ── Intraday 1-min ─────────────────────────────────
-        if do_intraday:
-            intra_file = intraday_dir / f"{ticker}.parquet"
-            if intra_file.exists() and not force:
-                _log(f"  {ticker} 1min: SKIP (exists)", log_path)
-            else:
-                df = fetch_intraday_ticker(
-                    ticker,
-                    start_date,
-                    end_date,
-                    api_key,
-                    exchange,
-                    chunk_days,
-                    delay,
-                    log_path,
-                )
-                _save_if_present(df, intra_file, ticker, "1min", log_path)
-                time.sleep(delay)
+        # Track progress with tqdm as tasks complete
+        with tqdm(total=len(universe), desc="Fetching") as pbar:
+            for future in as_completed(futures):
+                ticker = futures[future]
+                try:
+                    future.result()
+                    pbar.update(1)
+                except Exception as exc:
+                    _log(f"  {ticker} ERROR: {exc}", log_path)
+                    pbar.update(1)
 
     _log("Fetch complete.", log_path)
 
