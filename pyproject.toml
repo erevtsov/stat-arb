@@ -9,6 +9,8 @@ description = "Statistical arbitrage trading system for US equities using intrad
 requires-python = ">=3.11"
 dependencies = [
     "polars>=0.20.0",
+    "pandas>=2.0.0",
+    "pandas-market-calendars>=4.0.0",
     "statsmodels>=0.14.0",
     "requests>=2.31.0",
     "tqdm>=4.66.0",
