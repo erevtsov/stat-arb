@@ -43,8 +43,8 @@ from tqdm import tqdm
 # ──────────────────────────────────────────────────────────────────────
 CONFIG = {
     "EODHD_API_KEY": os.environ.get("EODHD_KEY", "your_key_here"),
-    "start_date": "2023-01-01",
-    "end_date": "2024-12-31",
+    "start_date": "2022-01-01",
+    "end_date": "2025-12-31",
     "exchange": "US",
     "exchange_calendar": "NYSE",  # pandas_market_calendars exchange name
     "intraday_chunk_days": 120,  # EODHD max per intraday request
@@ -207,10 +207,7 @@ def _filter_half_day_holidays(df: pl.DataFrame) -> pl.DataFrame:
     # For detected half-day holidays, only keep data up to 1pm
     df = df.filter(
         ~pl.col("date").is_in(holidays)
-        | (
-            pl.col("date").is_in(holidays)
-            & (pl.col("time") <= dt.time(13, 0))
-        )
+        | (pl.col("date").is_in(holidays) & (pl.col("time") <= dt.time(13, 0)))
     )
 
     return df
@@ -352,7 +349,9 @@ def fetch_intraday_ticker(
         rows_before = len(combined)
 
         # Filter to regular market hours (exclude pre-market and after-hours)
-        combined = _filter_market_hours(combined, start_date, end_date, exchange_calendar)
+        combined = _filter_market_hours(
+            combined, start_date, end_date, exchange_calendar
+        )
         _log(
             f"  {ticker} 1min: market hours filter: {rows_before} -> {len(combined)} rows",
             log_path,
