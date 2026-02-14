@@ -442,6 +442,8 @@ def load_processed(
     ticker: str,
     timeframe: str = "daily",
     processed_dir: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> pl.DataFrame:
     """
     Load preprocessed data for a ticker at a given timeframe.
@@ -450,18 +452,38 @@ def load_processed(
         ticker:        Stock ticker symbol.
         timeframe:     One of '1min', '5min', '15min', '1hour', 'daily'.
         processed_dir: Processed data base directory.
+        start_date:    Optional start date filter (YYYY-MM-DD or datetime).
+                       If None, loads from beginning.
+        end_date:      Optional end date filter (YYYY-MM-DD or datetime).
+                       If None, loads to end.
 
     Returns:
-        Polars DataFrame.
+        Polars DataFrame with OHLCV data and technical indicators.
 
     Raises:
         FileNotFoundError: If the processed file does not exist.
     """
     processed_dir = processed_dir or CONFIG["processed_dir"]
     path = Path(processed_dir) / timeframe / f"{ticker}.parquet"
+
     if not path.exists():
         raise FileNotFoundError(
             f"No processed data for {ticker} at {timeframe}. "
             f"Expected: {path}\nRun preprocess_all_tickers() first."
         )
-    return pl.read_parquet(path)
+
+    # Use scan_parquet for lazy loading with predicate pushdown
+    lazy_df = pl.scan_parquet(path)
+
+    # Apply date filters if specified (pushed down to Parquet reader)
+    if start_date is not None:
+        lazy_df = lazy_df.filter(
+            pl.col("timestamp") >= pl.lit(start_date).str.to_datetime()
+        )
+    if end_date is not None:
+        lazy_df = lazy_df.filter(
+            pl.col("timestamp") <= pl.lit(end_date).str.to_datetime()
+        )
+
+    # Collect the result
+    return lazy_df.collect()
