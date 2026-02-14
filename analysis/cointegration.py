@@ -419,7 +419,7 @@ def track_pair_stability(
     """
     Track cointegration metrics for a specific pair across multiple time windows.
 
-    Useful for validating Hypothesis H5 (coefficient stability) and monitoring
+    Useful for validating coefficient stability and monitoring
     pair health in production. Tests the same pair on different formation periods
     to see how hedge ratio, ADF statistic, and half-life evolve.
 

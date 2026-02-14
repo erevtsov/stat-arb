@@ -15,12 +15,6 @@ from tqdm import tqdm
 
 from utils.config import CONFIG
 
-# US equity regular market hours (Eastern Time)
-MARKET_OPEN_HOUR = 9
-MARKET_OPEN_MINUTE = 30
-MARKET_CLOSE_HOUR = 16
-MARKET_CLOSE_MINUTE = 0
-
 TIMEFRAMES = {
     "1min": "1m",
     "5min": "5m",
@@ -99,6 +93,54 @@ def load_splits(ticker: str, splits_dir: str | None = None) -> pl.DataFrame | No
     if not path.exists():
         return None
     return pl.read_parquet(path)
+
+
+def filter_market_hours(
+    df: pl.DataFrame,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    exchange_calendar: str = "NYSE",
+) -> pl.DataFrame:
+    """
+    Filter intraday data to only include regular trading hours.
+
+    Uses pandas_market_calendars to determine valid trading times,
+    excluding after-hours, pre-market trading, and non-trading days.
+
+    Args:
+        df: DataFrame with 'timestamp' column (timezone-aware US/Eastern)
+        start_date: Start date (YYYY-MM-DD). If None, uses min(df.timestamp)
+        end_date: End date (YYYY-MM-DD). If None, uses max(df.timestamp)
+        exchange_calendar: Exchange calendar name (default: NYSE)
+
+    Returns:
+        Filtered DataFrame with only regular market hours
+    """
+    import pandas_market_calendars as pcal
+
+    # Determine date range
+    if start_date is None:
+        start_date = df.select(pl.col("timestamp").min()).item().strftime("%Y-%m-%d")
+    if end_date is None:
+        end_date = df.select(pl.col("timestamp").max()).item().strftime("%Y-%m-%d")
+
+    # Get exchange calendar and schedule
+    calendar = pcal.get_calendar(exchange_calendar)
+    schedule = calendar.schedule(start_date=start_date, end_date=end_date)
+
+    # Generate minute-by-minute valid trading times
+    valid_times = pcal.date_range(schedule, frequency="1min", closed="both")
+
+    # Convert to Polars and match timezone
+    valid_times_series = pl.Series(valid_times).dt.convert_time_zone("US/Eastern")
+    valid_times_df = valid_times_series.dt.cast_time_unit("us").to_frame("timestamp")
+    valid_times_df = valid_times_df.with_columns(pl.lit(True).alias("is_market_hours"))
+
+    # Join and filter
+    df = df.join(valid_times_df, on="timestamp", how="left")
+    df = df.with_columns(pl.col("is_market_hours").fill_null(False))
+
+    return df.filter(pl.col("is_market_hours")).drop("is_market_hours")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -190,23 +232,8 @@ def clean(df: pl.DataFrame) -> pl.DataFrame:
     """
     df = df.unique(subset=["timestamp"]).sort("timestamp")
 
-    # Filter market hours: 09:30 <= time < 16:00
-    df = df.filter(
-        (
-            (pl.col("timestamp").dt.hour() > MARKET_OPEN_HOUR)
-            | (
-                (pl.col("timestamp").dt.hour() == MARKET_OPEN_HOUR)
-                & (pl.col("timestamp").dt.minute() >= MARKET_OPEN_MINUTE)
-            )
-        )
-        & (
-            (pl.col("timestamp").dt.hour() < MARKET_CLOSE_HOUR)
-            | (
-                (pl.col("timestamp").dt.hour() == MARKET_CLOSE_HOUR)
-                & (pl.col("timestamp").dt.minute() == 0)
-            )
-        )
-    )
+    # Filter to regular market hours using exchange calendar
+    df = filter_market_hours(df)
 
     # Drop nulls and invalid prices
     df = df.drop_nulls(subset=["open", "high", "low", "close"])
