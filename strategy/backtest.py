@@ -124,6 +124,7 @@ def _extract_trades(
     exit_reasons = df["exit_reason"].to_list()
     prices_a = df["price_a"].to_list()
     prices_b = df["price_b"].to_list()
+    hedge_ratios = df.get_column("hedge_ratio").to_list() if "hedge_ratio" in df.columns else None
 
     trades: list[dict] = []
     pending_entry = None
@@ -136,6 +137,7 @@ def _extract_trades(
                 "direction": "long" if positions[i] == 1 else "short",
                 "entry_price_a": prices_a[i],
                 "entry_price_b": prices_b[i],
+                "entry_index": i,
             }
 
         if exit_bars[i] and pending_entry is not None:
@@ -161,14 +163,36 @@ def _extract_trades(
             else:
                 pnl_gross = entry_spread - exit_spread
 
-            # Transaction cost: bps applied to entry notional
-            # Approximate: cost per leg on avg price of both legs
-            avg_price = (
-                pending_entry["entry_price_a"] + pending_entry["entry_price_b"]
-            ) / 2
-            # Round-trip = 2 legs entry + 2 legs exit = 4 legs total
-            # But convention: 20 bps per leg, 2 legs per trade side
-            cost = avg_price * (transaction_cost_bps / 10000) * 4
+            # Transaction cost calculation - FIXED
+            # We need the hedge ratio used to construct the spread
+            # Since spread = price_a - hedge_ratio * price_b
+            # A trade involves: 1 share of A, hedge_ratio shares of B
+            # Get hedge ratio from the row (will be added when we pass it through)
+            # For now, reconstruct it from the spread
+            entry_price_a = pending_entry["entry_price_a"]
+            entry_price_b = pending_entry["entry_price_b"]
+            exit_price_a = prices_a[i]
+            exit_price_b = prices_b[i]
+
+            # Reconstruct hedge ratio from spread: spread = price_a - hr * price_b
+            # We'll get this from the parent function via the dataframe
+            # For backward compatibility, estimate if not available
+            if hedge_ratios is not None:
+                hedge_ratio = hedge_ratios[pending_entry["entry_index"]]
+            else:
+                # Fallback: estimate from the spread values
+                # This is imperfect but maintains backward compatibility
+                hedge_ratio = (entry_price_a - entry_spread) / entry_price_b if entry_price_b != 0 else 1.0
+
+            # Calculate actual notional traded
+            # Entry: buy/sell 1 share of A + sell/buy hedge_ratio shares of B
+            entry_notional = abs(entry_price_a) + abs(hedge_ratio * entry_price_b)
+            exit_notional = abs(exit_price_a) + abs(hedge_ratio * exit_price_b)
+
+            # Transaction cost = (entry + exit notional) * bps / 10000
+            # Note: bps is per leg, and we have 2 legs (A and B) at entry and exit
+            # So total is 4 legs, but we count each leg's notional separately
+            cost = (entry_notional + exit_notional) * (transaction_cost_bps / 10000)
 
             trades.append(
                 {

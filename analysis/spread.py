@@ -27,7 +27,7 @@ def calculate_spread(
 
     Returns:
         Polars DataFrame with columns:
-        [timestamp, price_a, price_b, spread]
+        [timestamp, price_a, price_b, spread, hedge_ratio]
     """
     # Rename close columns before joining
     a = df_a.select(
@@ -42,7 +42,8 @@ def calculate_spread(
     merged = a.join(b, on="timestamp", how="inner").sort("timestamp")
 
     merged = merged.with_columns(
-        (pl.col("price_a") - hedge_ratio * pl.col("price_b")).alias("spread")
+        (pl.col("price_a") - hedge_ratio * pl.col("price_b")).alias("spread"),
+        pl.lit(hedge_ratio).alias("hedge_ratio"),
     )
 
     return merged
@@ -101,7 +102,7 @@ def build_spread_frame(
 
     Returns:
         Polars DataFrame with columns:
-        [timestamp, price_a, price_b, spread, rolling_mean, rolling_std, z_score]
+        [timestamp, price_a, price_b, spread, hedge_ratio, rolling_mean, rolling_std, z_score]
     """
     spread_df = calculate_spread(df_a, df_b, hedge_ratio)
     return calculate_zscore(spread_df, window)
