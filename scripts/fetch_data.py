@@ -44,7 +44,7 @@ CONFIG = {
     "intraday_chunk_days": 120,  # EODHD max per intraday request
     "request_delay": 0.1,  # seconds between API calls
     "base_url": "https://eodhd.com/api",
-    "max_workers": 5,  # number of concurrent threads for fetching
+    "max_workers": 12,  # number of concurrent threads for fetching
 }
 
 # Thread-safe logging lock
@@ -149,7 +149,7 @@ def fetch_1min_chunk(
         df = df.drop(["timestamp"]).rename({"datetime": "timestamp"})
 
     # Parse timestamp and convert to US/Eastern timezone
-    if df["timestamp"].dtype == pl.Utf8:
+    if df["timestamp"].dtype == pl.String:
         df = df.with_columns(
             pl.col("timestamp")
             .str.to_datetime(format="%Y-%m-%d %H:%M:%S", time_zone="UTC")

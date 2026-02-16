@@ -28,6 +28,7 @@ TIMEFRAMES = {
 # Raw data loaders
 # ──────────────────────────────────────────────────────────────────────
 
+
 def load_raw(ticker: str, raw_dir: str | None = None) -> pl.DataFrame:
     """
     Load raw 1-minute data for a single ticker.
@@ -147,6 +148,7 @@ def filter_market_hours(
 # Split adjustment
 # ──────────────────────────────────────────────────────────────────────
 
+
 def _parse_split_ratio(split_str: str) -> float:
     """
     Parse an EODHD split string like '4/1' into a float multiplier.
@@ -213,6 +215,7 @@ def adjust_intraday_for_splits(
 # Cleaning
 # ──────────────────────────────────────────────────────────────────────
 
+
 def clean(df: pl.DataFrame) -> pl.DataFrame:
     """
     Clean a 1-minute DataFrame.
@@ -245,6 +248,7 @@ def clean(df: pl.DataFrame) -> pl.DataFrame:
 # ──────────────────────────────────────────────────────────────────────
 # Resampling
 # ──────────────────────────────────────────────────────────────────────
+
 
 def resample(df: pl.DataFrame, timeframe: str) -> pl.DataFrame:
     """
@@ -303,6 +307,7 @@ def resample(df: pl.DataFrame, timeframe: str) -> pl.DataFrame:
 # EOD daily processing (uses EODHD adjusted_close directly)
 # ──────────────────────────────────────────────────────────────────────
 
+
 def process_eod_daily(
     ticker: str,
     eod_dir: str | None = None,
@@ -359,6 +364,7 @@ def process_eod_daily(
 # ──────────────────────────────────────────────────────────────────────
 # Top-level preprocessing functions
 # ──────────────────────────────────────────────────────────────────────
+
 
 def preprocess_ticker(
     ticker: str,
