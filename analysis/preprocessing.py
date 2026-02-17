@@ -235,6 +235,9 @@ def clean(df: pl.DataFrame) -> pl.DataFrame:
     # Filter to regular market hours using exchange calendar
     df = filter_market_hours(df)
 
+    # Reset the timezone - keep it becomes painful in the longrun
+    df = df.with_columns(pl.col("timestamp").dt.replace_time_zone(time_zone=None))
+
     # Drop nulls and invalid prices
     df = df.drop_nulls(subset=["open", "high", "low", "close"])
     df = df.filter(pl.col("close") > 0)
