@@ -34,18 +34,9 @@ import requests
 from tqdm import tqdm
 
 # ──────────────────────────────────────────────────────────────────────
-# Configuration – edit EODHD_API_KEY before running
+# Configuration – imported from utils.config (api_key read from EODHD_KEY env var)
 # ──────────────────────────────────────────────────────────────────────
-CONFIG = {
-    "EODHD_API_KEY": os.environ.get("EODHD_KEY", "your_key_here"),
-    "start_date": "2022-01-01",
-    "end_date": "2025-12-31",
-    "exchange": "US",
-    "intraday_chunk_days": 120,  # EODHD max per intraday request
-    "request_delay": 0.1,  # seconds between API calls
-    "base_url": "https://eodhd.com/api",
-    "max_workers": 5,  # number of concurrent threads for fetching
-}
+from utils.config import CONFIG, get_all_tickers  # noqa: E402
 
 # Thread-safe logging lock
 _log_lock = threading.Lock()
@@ -125,7 +116,7 @@ def fetch_1min_chunk(
     Returns Polars DataFrame [timestamp, open, high, low, close, volume]
     or None on failure / empty response.
     """
-    base = CONFIG["base_url"]
+    base = CONFIG.api.base_url
     from_ts = int(datetime.strptime(start, "%Y-%m-%d").timestamp())
     to_ts = int((datetime.strptime(end, "%Y-%m-%d") + timedelta(days=1)).timestamp())
     url = (
@@ -239,7 +230,7 @@ def fetch_eod_ticker(
 
     Returns [date, open, high, low, close, adjusted_close, volume].
     """
-    base = CONFIG["base_url"]
+    base = CONFIG.api.base_url
     url = (
         f"{base}/eod/{ticker}.{exchange}"
         f"?api_token={api_key}&fmt=json"
@@ -288,7 +279,7 @@ def fetch_splits_ticker(
 
     Returns [date, split] where split is a string like '4/1'.
     """
-    base = CONFIG["base_url"]
+    base = CONFIG.api.base_url
     url = (
         f"{base}/splits/{ticker}.{exchange}"
         f"?api_token={api_key}&fmt=json"
@@ -329,7 +320,7 @@ def fetch_dividends_ticker(
 
     Returns at minimum [date, value] (dividend amount per share).
     """
-    base = CONFIG["base_url"]
+    base = CONFIG.api.base_url
     url = (
         f"{base}/div/{ticker}.{exchange}"
         f"?api_token={api_key}&fmt=json"
@@ -447,31 +438,23 @@ def main() -> None:
     parser.add_argument(
         "--workers",
         type=int,
-        default=CONFIG["max_workers"],
-        help=f"Number of concurrent worker threads (default: {CONFIG['max_workers']})",
+        default=CONFIG.api.max_workers,
+        help=f"Number of concurrent worker threads (default: {CONFIG.api.max_workers})",
     )
     args = parser.parse_args()
 
-    api_key = CONFIG["EODHD_API_KEY"]
+    api_key = CONFIG.api.api_key
     if api_key == "your_key_here":
-        print("ERROR: Set your EODHD_API_KEY in CONFIG before running.")
+        print("ERROR: Set EODHD_KEY environment variable before running.")
         sys.exit(1)
 
-    # Import universe from central config
-    try:
-        from utils.config import get_all_tickers
+    universe = get_all_tickers()
 
-        universe = get_all_tickers()
-    except ImportError:
-        print("ERROR: Could not import universe from utils.config.")
-        print("Make sure you run from the project root directory.")
-        sys.exit(1)
-
-    start_date = CONFIG["start_date"]
-    end_date = CONFIG["end_date"]
-    exchange = CONFIG["exchange"]
-    chunk_days = CONFIG["intraday_chunk_days"]
-    delay = CONFIG["request_delay"]
+    start_date = CONFIG.api.start_date
+    end_date = CONFIG.api.end_date
+    exchange = CONFIG.api.exchange
+    chunk_days = CONFIG.api.intraday_chunk_days
+    delay = CONFIG.api.request_delay
 
     # Directories
     data_root = Path("data")

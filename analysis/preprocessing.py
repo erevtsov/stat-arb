@@ -43,7 +43,7 @@ def load_raw(ticker: str, raw_dir: str | None = None) -> pl.DataFrame:
     Raises:
         FileNotFoundError: If the Parquet file does not exist.
     """
-    raw_dir = raw_dir or CONFIG["raw_dir"]
+    raw_dir = raw_dir or CONFIG.paths.raw_dir
     path = Path(raw_dir) / f"{ticker}.parquet"
     if not path.exists():
         raise FileNotFoundError(
@@ -72,7 +72,7 @@ def load_raw_eod(ticker: str, eod_dir: str | None = None) -> pl.DataFrame:
     Raises:
         FileNotFoundError: If the Parquet file does not exist.
     """
-    eod_dir = eod_dir or CONFIG["raw_eod_dir"]
+    eod_dir = eod_dir or CONFIG.paths.raw_eod_dir
     path = Path(eod_dir) / f"{ticker}.parquet"
     if not path.exists():
         raise FileNotFoundError(
@@ -88,7 +88,7 @@ def load_splits(ticker: str, splits_dir: str | None = None) -> pl.DataFrame | No
 
     Returns DataFrame with at least [date, split] columns.
     """
-    splits_dir = splits_dir or CONFIG["splits_dir"]
+    splits_dir = splits_dir or CONFIG.paths.splits_dir
     path = Path(splits_dir) / f"{ticker}.parquet"
     if not path.exists():
         return None
@@ -326,8 +326,8 @@ def process_eod_daily(
     Returns:
         Number of daily bars saved.
     """
-    eod_dir = eod_dir or CONFIG["raw_eod_dir"]
-    processed_dir = processed_dir or CONFIG["processed_dir"]
+    eod_dir = eod_dir or CONFIG.paths.raw_eod_dir
+    processed_dir = processed_dir or CONFIG.paths.processed_dir
 
     df = load_raw_eod(ticker, eod_dir)
 
@@ -384,14 +384,14 @@ def preprocess_ticker(
     Returns:
         Dict mapping timeframe -> number of bars saved.
     """
-    raw_dir = raw_dir or CONFIG["raw_dir"]
-    processed_dir = processed_dir or CONFIG["processed_dir"]
-    splits_dir = splits_dir or CONFIG["splits_dir"]
+    raw_dir = raw_dir or CONFIG.paths.raw_dir
+    processed_dir = processed_dir or CONFIG.paths.processed_dir
+    splits_dir = splits_dir or CONFIG.paths.splits_dir
 
     counts: dict[str, int] = {}
 
     # ── EOD daily (from EODHD adjusted_close) ──────────────
-    eod_dir = CONFIG.get("raw_eod_dir")
+    eod_dir = CONFIG.paths.raw_eod_dir
     if eod_dir and (Path(eod_dir) / f"{ticker}.parquet").exists():
         counts["daily"] = process_eod_daily(ticker, eod_dir, processed_dir)
 
@@ -437,9 +437,9 @@ def preprocess_all_tickers(
     Returns:
         Polars DataFrame summarizing bars per timeframe per ticker.
     """
-    raw_dir = raw_dir or CONFIG["raw_dir"]
-    processed_dir = processed_dir or CONFIG["processed_dir"]
-    eod_dir = CONFIG.get("raw_eod_dir", "")
+    raw_dir = raw_dir or CONFIG.paths.raw_dir
+    processed_dir = processed_dir or CONFIG.paths.processed_dir
+    eod_dir = CONFIG.paths.raw_eod_dir
 
     if tickers is None:
         # Collect tickers that have *either* intraday or EOD data
@@ -493,7 +493,7 @@ def load_processed(
     Raises:
         FileNotFoundError: If the processed file does not exist.
     """
-    processed_dir = processed_dir or CONFIG["processed_dir"]
+    processed_dir = processed_dir or CONFIG.paths.processed_dir
     path = Path(processed_dir) / timeframe / f"{ticker}.parquet"
 
     if not path.exists():

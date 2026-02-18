@@ -141,13 +141,13 @@ def find_cointegrated_pairs(
             end_date="2023-06-30"
         )
     """
-    processed_dir = processed_dir or CONFIG["processed_dir"]
-    p_value_threshold = p_value_threshold or CONFIG["coint_p_value_threshold"]
+    processed_dir = processed_dir or CONFIG.paths.processed_dir
+    p_value_threshold = p_value_threshold or CONFIG.cointegration.p_value_threshold
     min_half_life = (
-        min_half_life if min_half_life is not None else CONFIG["min_half_life"]
+        min_half_life if min_half_life is not None else CONFIG.cointegration.min_half_life
     )
     max_half_life = (
-        max_half_life if max_half_life is not None else CONFIG["max_half_life"]
+        max_half_life if max_half_life is not None else CONFIG.cointegration.max_half_life
     )
 
     # Load close prices for all available tickers at specified timeframe
@@ -159,7 +159,7 @@ def find_cointegrated_pairs(
         )
 
     available_files = {p.stem for p in timeframe_dir.glob("*.parquet")}
-    sector_mapping = CONFIG["sector_mapping"]
+    sector_mapping = CONFIG.universe.sector_mapping
 
     if tickers is None:
         tickers = sorted(available_files & set(sector_mapping.keys()))
@@ -326,8 +326,8 @@ def find_cointegrated_pairs(
 
 
 def find_cointegrated_pairs_rolling(
-    window_months: int,
-    step_months: int,
+    window_days: int,
+    step_days: int,
     start_date: str,
     end_date: str,
     **kwargs,
@@ -339,23 +339,23 @@ def find_cointegrated_pairs_rolling(
     testing on each window independently.
 
     Args:
-        window_months: Size of formation window in months (default: 6).
-        step_months:   Step size between windows in months (default: 1).
-                       If step_months == window_months, windows are non-overlapping.
-        start_date:    First window start date (YYYY-MM-DD).
-        end_date:      Last window end date (YYYY-MM-DD).
-        **kwargs:      Additional arguments passed to find_cointegrated_pairs()
-                       (tickers, timeframe, thresholds, etc.).
+        window_days: Size of formation window in calendar days (e.g. 84 ≈ 60 trading days).
+        step_days:   Step size between windows in calendar days (e.g. 1 = daily recomputation).
+                     If step_days == window_days, windows are non-overlapping.
+        start_date:  First window start date (YYYY-MM-DD).
+        end_date:    Last window end date (YYYY-MM-DD).
+        **kwargs:    Additional arguments passed to find_cointegrated_pairs()
+                     (tickers, timeframe, thresholds, etc.).
 
     Returns:
         Dict mapping window identifiers to cointegration results DataFrames.
         Keys are formatted as "YYYY-MM-DD_YYYY-MM-DD" (start_end).
 
     Example:
-        # 6-month rolling windows, 1-month step (overlapping)
+        # 84-day rolling window (≈60 trading days), 1-day step (daily recomputation)
         results = find_cointegrated_pairs_rolling(
-            window_months=6,
-            step_months=1,
+            window_days=84,
+            step_days=1,
             start_date="2023-01-01",
             end_date="2024-12-31",
             timeframe="15min",
@@ -363,15 +363,13 @@ def find_cointegrated_pairs_rolling(
         )
 
         # Access specific window
-        window1_pairs = results["2023-01-01_2023-06-30"]
+        window1_pairs = results["2023-01-01_2023-03-26"]
 
         # Analyze all windows
         for window_id, pairs_df in results.items():
             print(f"{window_id}: {len(pairs_df)} pairs")
     """
-    from datetime import datetime
-
-    from dateutil.relativedelta import relativedelta
+    from datetime import datetime, timedelta
 
     # Parse dates
     current_start = datetime.fromisoformat(start_date)
@@ -382,7 +380,7 @@ def find_cointegrated_pairs_rolling(
 
     while True:
         # Calculate window end
-        window_end = current_start + relativedelta(months=window_months)
+        window_end = current_start + timedelta(days=window_days)
 
         # Stop if window extends beyond final_end
         if window_end > final_end:
@@ -403,7 +401,7 @@ def find_cointegrated_pairs_rolling(
         window_count += 1
 
         # Move to next window
-        current_start = current_start + relativedelta(months=step_months)
+        current_start = current_start + timedelta(days=step_days)
 
     print(f"Completed {window_count} windows")
     return results
