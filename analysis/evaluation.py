@@ -171,9 +171,11 @@ def compute_hit_rate(
     Returns:
         Hit rate in [0, 1], or 0.0 if no active signals with non-null returns.
     """
-    df = pl.DataFrame({"sig": binary_signal, "fr": forward_returns}).filter(
-        pl.col("sig") != 0
-    ).drop_nulls()
+    df = (
+        pl.DataFrame({"sig": binary_signal, "fr": forward_returns})
+        .filter(pl.col("sig") != 0)
+        .drop_nulls()
+    )
 
     if len(df) == 0:
         return 0.0
@@ -197,8 +199,9 @@ def evaluate_all(
     For each horizon in ``holding_bars_list`` and each trading date:
       1. Compute gross forward returns.
       2. Compute net forward returns.
-      3. Compute cross-sectional Spearman IC (gross and net) on weighted signals.
-      4. Compute binary signal hit rate.
+      3. Compute cross-sectional Spearman IC (gross) on weighted signals.
+      4. Compute mean net return across active signals.
+      5. Compute binary signal hit rate.
 
     Args:
         signals_df:        Full signals DataFrame (all pairs, all timestamps).
@@ -213,7 +216,7 @@ def evaluate_all(
     Returns:
         Polars DataFrame with schema:
         [date: Utf8, n_bars: Int64, ic_gross_weighted: Float64,
-         ic_net_weighted: Float64, hit_rate_binary: Float64,
+         mean_net_return: Float64, hit_rate_binary: Float64,
          n_observations: Int64]
     """
     dates = signals_df["date"].unique().sort().to_list()
@@ -226,20 +229,25 @@ def evaluate_all(
             with_gross = compute_forward_returns(day_signals, prices, n_bars)
             with_net = compute_net_forward_returns(with_gross, cost_bps=cost_bps)
 
-            # Filter to active signals only for IC computation
+            # Filter to active signals only
             active = with_net.filter(pl.col("signal_binary") != 0)
             n_obs = len(active)
 
             ic_gross = compute_ic(active["signal_weighted"], active["fwd_return_gross"])
-            ic_net = compute_ic(active["signal_weighted"], active["fwd_return_net"])
-            hit = compute_hit_rate(with_net["signal_binary"], with_net["fwd_return_gross"])
+
+            net_vals = active["fwd_return_net"].drop_nulls()
+            mean_net = float(net_vals.mean()) if len(net_vals) > 0 else None
+
+            hit = compute_hit_rate(
+                with_net["signal_binary"], with_net["fwd_return_gross"]
+            )
 
             result_rows.append(
                 {
                     "date": date,
                     "n_bars": n_bars,
                     "ic_gross_weighted": ic_gross,
-                    "ic_net_weighted": ic_net,
+                    "mean_net_return": mean_net,
                     "hit_rate_binary": hit,
                     "n_observations": n_obs,
                 }
@@ -251,7 +259,7 @@ def evaluate_all(
                 "date": pl.Utf8,
                 "n_bars": pl.Int64,
                 "ic_gross_weighted": pl.Float64,
-                "ic_net_weighted": pl.Float64,
+                "mean_net_return": pl.Float64,
                 "hit_rate_binary": pl.Float64,
                 "n_observations": pl.Int64,
             }

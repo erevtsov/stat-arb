@@ -165,15 +165,15 @@ def compute_pvalue_weights(pairs_df: pl.DataFrame) -> pl.DataFrame:
     """
     n = len(pairs_df)
     if n == 0:
-        return pairs_df.with_columns(pl.lit(None).cast(pl.Float64).alias("signal_weight"))
+        return pairs_df.with_columns(
+            pl.lit(None).cast(pl.Float64).alias("signal_weight")
+        )
 
     # Ranks are 1-based; pairs_df is already sorted by p_value ascending
     inv_ranks = [1.0 / (i + 1) for i in range(n)]
     total = sum(inv_ranks)
     weights = [w / total for w in inv_ranks]
-    return pairs_df.with_columns(
-        pl.Series("signal_weight", weights, dtype=pl.Float64)
-    )
+    return pairs_df.with_columns(pl.Series("signal_weight", weights, dtype=pl.Float64))
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +298,18 @@ def generate_pair_signals_for_day(
             }
         )
 
-    return pl.DataFrame(rows).with_columns(
-        pl.col("signal_binary").cast(pl.Int32)
+    return pl.DataFrame(
+        rows,
+        schema={
+            "date": pl.Utf8,
+            "timestamp": pl.Datetime,
+            "ticker_a": pl.Utf8,
+            "ticker_b": pl.Utf8,
+            "hedge_ratio": pl.Float64,
+            "p_value": pl.Float64,
+            "signal_weight": pl.Float64,
+            "zscore": pl.Float64,
+            "signal_binary": pl.Int32,
+            "signal_weighted": pl.Float64,
+        },
     )
