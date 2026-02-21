@@ -52,7 +52,7 @@ class ApiConfig:
     api_key: str = "your_key_here"  # override via EODHD_KEY env var at runtime
     exchange: str = "US"
     max_workers: int = 5
-    start_date: str = "2022-01-01"
+    start_date: str = "2020-01-01"
     end_date: str = "2025-12-31"
     intraday_chunk_days: int = 120
     request_delay: float = 0.2
@@ -61,15 +61,15 @@ class ApiConfig:
 @dataclass
 class CointegrationConfig:
     p_value_threshold: float = 0.05
-    min_half_life: int = 5    # trading days
+    min_half_life: int = 5  # trading days
     max_half_life: int = 120  # trading days
     rolling_window_days: int = 84  # ~60 trading days in calendar days
-    rolling_step_days: int = 1     # daily recomputation
+    rolling_step_days: int = 1  # daily recomputation
 
 
 @dataclass
 class SignalConfig:
-    zscore_window_days: int = 5    # converted to bars at runtime
+    zscore_window_days: int = 5  # converted to bars at runtime
     z_entry: float = 2.5
     z_exit: float = 0.0
     z_stop: float = 4.0
@@ -116,116 +116,116 @@ CONFIG.api.api_key = os.environ.get("EODHD_KEY", CONFIG.api.api_key)
 
 CONFIG.universe.sector_mapping = {
     # ── Technology (10) ─────────────────────────────────────
-    "AAPL":  "Technology",
-    "MSFT":  "Technology",
+    "AAPL": "Technology",
+    "MSFT": "Technology",
     "GOOGL": "Technology",
-    "META":  "Technology",
-    "NVDA":  "Technology",
-    "AMD":   "Technology",
-    "INTC":  "Technology",
-    "CRM":   "Technology",
-    "ADBE":  "Technology",
-    "ORCL":  "Technology",
+    "META": "Technology",
+    "NVDA": "Technology",
+    "AMD": "Technology",
+    "INTC": "Technology",
+    "CRM": "Technology",
+    "ADBE": "Technology",
+    "ORCL": "Technology",
     # ── Semiconductors (9) ──────────────────────────────────
-    "AVGO":  "Semiconductors",
-    "TXN":   "Semiconductors",
-    "QCOM":  "Semiconductors",
-    "MU":    "Semiconductors",
-    "LRCX":  "Semiconductors",
-    "AMAT":  "Semiconductors",
-    "KLAC":  "Semiconductors",
-    "MCHP":  "Semiconductors",
-    "ON":    "Semiconductors",
+    "AVGO": "Semiconductors",
+    "TXN": "Semiconductors",
+    "QCOM": "Semiconductors",
+    "MU": "Semiconductors",
+    "LRCX": "Semiconductors",
+    "AMAT": "Semiconductors",
+    "KLAC": "Semiconductors",
+    "MCHP": "Semiconductors",
+    "ON": "Semiconductors",
     # ── Financials (10) ─────────────────────────────────────
-    "JPM":   "Financials",
-    "BAC":   "Financials",
-    "GS":    "Financials",
-    "MS":    "Financials",
-    "WFC":   "Financials",
-    "C":     "Financials",
-    "BLK":   "Financials",
-    "SCHW":  "Financials",
-    "USB":   "Financials",
-    "PNC":   "Financials",
+    "JPM": "Financials",
+    "BAC": "Financials",
+    "GS": "Financials",
+    "MS": "Financials",
+    "WFC": "Financials",
+    "C": "Financials",
+    "BLK": "Financials",
+    "SCHW": "Financials",
+    "USB": "Financials",
+    "PNC": "Financials",
     # ── Healthcare / Pharma (10) ────────────────────────────
-    "JNJ":   "Healthcare",
-    "PFE":   "Healthcare",
-    "UNH":   "Healthcare",
-    "MRK":   "Healthcare",
-    "ABT":   "Healthcare",
-    "TMO":   "Healthcare",
-    "LLY":   "Healthcare",
-    "ABBV":  "Healthcare",
-    "BMY":   "Healthcare",
-    "AMGN":  "Healthcare",
+    "JNJ": "Healthcare",
+    "PFE": "Healthcare",
+    "UNH": "Healthcare",
+    "MRK": "Healthcare",
+    "ABT": "Healthcare",
+    "TMO": "Healthcare",
+    "LLY": "Healthcare",
+    "ABBV": "Healthcare",
+    "BMY": "Healthcare",
+    "AMGN": "Healthcare",
     # ── Consumer Discretionary (10) ─────────────────────────
-    "AMZN":  "Consumer Discretionary",
-    "TSLA":  "Consumer Discretionary",
-    "HD":    "Consumer Discretionary",
-    "MCD":   "Consumer Discretionary",
-    "NKE":   "Consumer Discretionary",
-    "SBUX":  "Consumer Discretionary",
-    "LOW":   "Consumer Discretionary",
-    "TJX":   "Consumer Discretionary",
-    "BKNG":  "Consumer Discretionary",
-    "CMG":   "Consumer Discretionary",
+    "AMZN": "Consumer Discretionary",
+    "TSLA": "Consumer Discretionary",
+    "HD": "Consumer Discretionary",
+    "MCD": "Consumer Discretionary",
+    "NKE": "Consumer Discretionary",
+    "SBUX": "Consumer Discretionary",
+    "LOW": "Consumer Discretionary",
+    "TJX": "Consumer Discretionary",
+    "BKNG": "Consumer Discretionary",
+    "CMG": "Consumer Discretionary",
     # ── Consumer Staples (9) ────────────────────────────────
-    "WMT":   "Consumer Staples",
-    "PG":    "Consumer Staples",
-    "COST":  "Consumer Staples",
-    "KO":    "Consumer Staples",
-    "PEP":   "Consumer Staples",
-    "PM":    "Consumer Staples",
-    "CL":    "Consumer Staples",
-    "MDLZ":  "Consumer Staples",
-    "KHC":   "Consumer Staples",
+    "WMT": "Consumer Staples",
+    "PG": "Consumer Staples",
+    "COST": "Consumer Staples",
+    "KO": "Consumer Staples",
+    "PEP": "Consumer Staples",
+    "PM": "Consumer Staples",
+    "CL": "Consumer Staples",
+    "MDLZ": "Consumer Staples",
+    "KHC": "Consumer Staples",
     # ── Energy (9) ──────────────────────────────────────────
-    "XOM":   "Energy",
-    "CVX":   "Energy",
-    "COP":   "Energy",
-    "SLB":   "Energy",
-    "EOG":   "Energy",
-    "MPC":   "Energy",
-    "PSX":   "Energy",
-    "VLO":   "Energy",
-    "OXY":   "Energy",
+    "XOM": "Energy",
+    "CVX": "Energy",
+    "COP": "Energy",
+    "SLB": "Energy",
+    "EOG": "Energy",
+    "MPC": "Energy",
+    "PSX": "Energy",
+    "VLO": "Energy",
+    "OXY": "Energy",
     # ── Industrials (10) ────────────────────────────────────
-    "CAT":   "Industrials",
-    "DE":    "Industrials",
-    "UNP":   "Industrials",
-    "HON":   "Industrials",
-    "UPS":   "Industrials",
-    "BA":    "Industrials",
-    "RTX":   "Industrials",
-    "LMT":   "Industrials",
-    "GE":    "Industrials",
-    "MMM":   "Industrials",
+    "CAT": "Industrials",
+    "DE": "Industrials",
+    "UNP": "Industrials",
+    "HON": "Industrials",
+    "UPS": "Industrials",
+    "BA": "Industrials",
+    "RTX": "Industrials",
+    "LMT": "Industrials",
+    "GE": "Industrials",
+    "MMM": "Industrials",
     # ── Communication Services (9) ──────────────────────────
-    "GOOG":  "Communication Services",
-    "DIS":   "Communication Services",
+    "GOOG": "Communication Services",
+    "DIS": "Communication Services",
     "CMCSA": "Communication Services",
-    "NFLX":  "Communication Services",
-    "T":     "Communication Services",
-    "VZ":    "Communication Services",
-    "TMUS":  "Communication Services",
-    "CHTR":  "Communication Services",
-    "EA":    "Communication Services",
+    "NFLX": "Communication Services",
+    "T": "Communication Services",
+    "VZ": "Communication Services",
+    "TMUS": "Communication Services",
+    "CHTR": "Communication Services",
+    "EA": "Communication Services",
     # ── Utilities (7) ───────────────────────────────────────
-    "NEE":   "Utilities",
-    "DUK":   "Utilities",
-    "SO":    "Utilities",
-    "D":     "Utilities",
-    "AEP":   "Utilities",
-    "SRE":   "Utilities",
-    "EXC":   "Utilities",
+    "NEE": "Utilities",
+    "DUK": "Utilities",
+    "SO": "Utilities",
+    "D": "Utilities",
+    "AEP": "Utilities",
+    "SRE": "Utilities",
+    "EXC": "Utilities",
     # ── REITs (7) ───────────────────────────────────────────
-    "PLD":   "REITs",
-    "AMT":   "REITs",
-    "CCI":   "REITs",
-    "EQIX":  "REITs",
-    "SPG":   "REITs",
-    "PSA":   "REITs",
-    "O":     "REITs",
+    "PLD": "REITs",
+    "AMT": "REITs",
+    "CCI": "REITs",
+    "EQIX": "REITs",
+    "SPG": "REITs",
+    "PSA": "REITs",
+    "O": "REITs",
 }
 
 
@@ -264,10 +264,7 @@ def get_sector(ticker: str) -> str:
 
 def get_tickers_by_sector(sector: str) -> list[str]:
     """Return all tickers belonging to a given sector."""
-    return [
-        t for t, s in CONFIG.universe.sector_mapping.items()
-        if s == sector
-    ]
+    return [t for t, s in CONFIG.universe.sector_mapping.items() if s == sector]
 
 
 def get_all_sectors() -> list[str]:
