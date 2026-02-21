@@ -8,3 +8,4 @@ results/
 .env
 .venv/
 .python-version
+settings.json
