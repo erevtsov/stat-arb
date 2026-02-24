@@ -505,14 +505,16 @@ def load_processed(
     # Use scan_parquet for lazy loading with predicate pushdown
     lazy_df = pl.scan_parquet(path)
 
-    # Apply date filters if specified (pushed down to Parquet reader)
+    # Apply date filters using date comparison so that the full end_date day is
+    # included.  Comparing against a datetime literal truncates at midnight and
+    # silently excludes every market-hours bar on end_date.
     if start_date is not None:
         lazy_df = lazy_df.filter(
-            pl.col("timestamp") >= pl.lit(start_date).str.to_datetime()
+            pl.col("timestamp").dt.date() >= pl.lit(start_date).str.to_date()
         )
     if end_date is not None:
         lazy_df = lazy_df.filter(
-            pl.col("timestamp") <= pl.lit(end_date).str.to_datetime()
+            pl.col("timestamp").dt.date() <= pl.lit(end_date).str.to_date()
         )
 
     # Collect the result

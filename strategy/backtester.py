@@ -50,6 +50,7 @@ class PositionState:
     ticker_a: str
     ticker_b: str
     p_value: float
+    entry_day_idx: int = 0  # day index when position was opened (for max-hold)
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +167,8 @@ def run_backtest(
     max_pairs: int | None = None,
     capital: float | None = None,
     cost_bps: float | None = None,
+    min_bars_remaining: int = 8,
+    max_holding_days: int = 5,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """
     Run the full intraday pairs-trading backtest.
@@ -185,6 +188,14 @@ def run_backtest(
                               Defaults to CONFIG.portfolio.capital.
         cost_bps:             One-way cost per leg in bps.
                               Defaults to CONFIG.portfolio.transaction_cost_bps.
+        min_bars_remaining:   Minimum bars that must remain in the trading day
+                              after the entry execution bar.  Prevents late-day
+                              entries that have no time for mean reversion.
+                              Default 8 bars (2 hours at 15-min).
+        max_holding_days:     Maximum calendar days a position may be held before
+                              forced close.  Default 5 days.  Positions that have
+                              not hit z_exit or z_stop are allowed to carry
+                              overnight so the spread has time to mean-revert.
 
     Returns:
         (trades_df, daily_pnl_df) — see module docstring for schemas.
@@ -203,8 +214,6 @@ def run_backtest(
     )
 
     zscore_window = zscore_window_bars(timeframe)
-    max_hold_bars = max_holding_bars(timeframe)
-    minutes_per_bar = MINUTES_PER_BAR[timeframe]
     # Number of lookback trading days needed to warm up the z-score window
     zscore_lookback_days = CONFIG.signal.zscore_window_days + 1
 
@@ -251,12 +260,11 @@ def run_backtest(
             set(pairs_df["ticker_a"].to_list() + pairs_df["ticker_b"].to_list())
         )
 
-        # Load intraday prices: include zscore lookback window so that the
-        # rolling z-score is fully populated when signals are generated.
-        # load_processed end_date is exclusive, so pass day + 1 to include today.
+        # Load intraday prices with z-score lookback window.
+        # load_processed end_date is now inclusive (date comparison), so
+        # pass `day` directly — no +1 workaround needed.
         lookback_start = trading_days[max(0, day_idx - zscore_lookback_days)]
-        day_end = day + dt.timedelta(days=1)
-        day_prices = _load_day_prices(all_tickers_today, lookback_start, day_end, timeframe)
+        day_prices = _load_day_prices(all_tickers_today, lookback_start, day, timeframe)
 
         if not day_prices:
             daily_pnl_rows.append(
@@ -271,7 +279,9 @@ def run_backtest(
             )
             continue
 
-        # Generate signals for the full day
+        # Generate signals for the full lookback + today.
+        # No time stop (max_holding_bars=None): positions run until the z_exit
+        # or z_stop signal fires, or until the EOD forced close below.
         try:
             signals_day = generate_pair_signals_for_day(
                 pairs_df=pairs_df,
@@ -281,7 +291,7 @@ def run_backtest(
                 z_entry=z_entry,
                 z_exit=z_exit,
                 z_stop=z_stop,
-                max_holding_bars=max_hold_bars,
+                max_holding_bars=None,
             )
         except Exception:
             daily_pnl_rows.append(
@@ -322,15 +332,16 @@ def run_backtest(
         bars: list = sorted(signals_day["timestamp"].unique().to_list())
         n_bars_day = len(bars)
 
-        # Build quick-access: (ticker_a, ticker_b, bar_ts) → signal_binary
+        # Build quick-access lookups for signal and z-score
         sig_map: dict[tuple, int] = {}
+        zscore_map: dict[tuple, float | None] = {}
         for row in signals_day.iter_rows(named=True):
             key = (row["ticker_a"], row["ticker_b"], row["timestamp"])
             sig_map[key] = row["signal_binary"]
+            zscore_map[key] = row["zscore"]
 
         # Ordered pairs list (by p_value ascending = best signal first)
-        pairs_list = pairs_df.sort("p_value").iter_rows(named=True)
-        pairs_ordered = list(pairs_list)
+        pairs_ordered = list(pairs_df.sort("p_value").iter_rows(named=True))
 
         day_gross_pnl = 0.0
         day_net_pnl = 0.0
@@ -338,6 +349,7 @@ def run_backtest(
 
         for bar_idx, bar_ts in enumerate(bars):
             is_last_bar = bar_idx == n_bars_day - 1
+            is_last_trading_day = day_idx == len(trading_days) - 1
             next_bar_ts = bars[bar_idx + 1] if not is_last_bar else None
 
             # --- Exit checks (existing positions) ---
@@ -348,10 +360,15 @@ def run_backtest(
                 sig = sig_map.get((ticker_a, ticker_b, bar_ts), 0)
 
                 # Determine if we should exit
-                should_exit = is_last_bar
+                # Force-close only on: last bar of last trading day, OR max hold exceeded.
+                # Regular EOD (non-final days) does NOT force close — positions carry overnight.
+                max_hold_exceeded = (day_idx - pos.entry_day_idx) >= max_holding_days
+                should_exit = (is_last_bar and is_last_trading_day) or (is_last_bar and max_hold_exceeded)
 
-                if not is_last_bar:
-                    # Check if signal went to 0 (mean reversion / stoploss / time stop)
+                if not should_exit:
+                    # Check if signal went to 0 (mean reversion or stop loss).
+                    # On bar_idx=0, use pos.direction as the "previous" signal
+                    # since we know a position is already open.
                     prev_bar_ts = bars[bar_idx - 1] if bar_idx > 0 else None
                     prev_sig = (
                         sig_map.get((ticker_a, ticker_b, prev_bar_ts), 0)
@@ -364,9 +381,10 @@ def run_backtest(
                 if not should_exit:
                     continue
 
-                # Determine exit price
-                if is_last_bar:
-                    exit_reason = "eod"
+                # Determine exit price and reason
+                force_close = (is_last_bar and is_last_trading_day) or (is_last_bar and max_hold_exceeded)
+                if force_close:
+                    exit_reason = "max_hold" if max_hold_exceeded else "eod"
                     bars_a = bar_lookup.get(ticker_a, {})
                     bars_b = bar_lookup.get(ticker_b, {})
                     bar_a = bars_a.get(bar_ts)
@@ -377,7 +395,13 @@ def run_backtest(
                     exit_price_a = bar_a["close"]
                     exit_price_b = bar_b["close"]
                 else:
-                    exit_reason = "signal"
+                    # Infer granular exit reason from z-score at the exit bar.
+                    z_at_exit = zscore_map.get((ticker_a, ticker_b, bar_ts))
+                    if z_at_exit is not None and abs(z_at_exit) > z_stop:
+                        exit_reason = "z_stop"
+                    else:
+                        exit_reason = "z_exit"
+
                     bars_a = bar_lookup.get(ticker_a, {})
                     bars_b = bar_lookup.get(ticker_b, {})
                     nbar_a = bars_a.get(next_bar_ts)
@@ -399,11 +423,7 @@ def run_backtest(
                     pos, exit_price_a, exit_price_b, cost_bps
                 )
 
-                # Determine exit time
-                if is_last_bar:
-                    exit_ts = bar_ts
-                else:
-                    exit_ts = next_bar_ts if next_bar_ts else bar_ts
+                exit_ts = bar_ts if is_last_bar else (next_bar_ts or bar_ts)
 
                 all_trades.append(
                     {
@@ -436,6 +456,11 @@ def run_backtest(
             if is_last_bar:
                 break
 
+            # How many bars remain after the entry execution bar (next_bar_ts)?
+            # bars_after_entry = n_bars_day - bar_idx - 2
+            # (subtract current bar and the entry bar itself)
+            bars_after_entry = n_bars_day - bar_idx - 2
+
             # --- Entry checks (new positions) ---
             for pair_row in pairs_ordered:
                 if len(open_positions) >= max_pairs:
@@ -452,7 +477,16 @@ def run_backtest(
                 if sig == 0:
                     continue
 
-                # Only enter on signal transition (0 → ±1)
+                # Require sufficient bars remaining so mean reversion has time
+                # to occur before the EOD forced close.
+                if bars_after_entry < min_bars_remaining:
+                    continue
+
+                # Only enter on a genuine z_entry crossing.
+                # On bar_idx=0 the "previous" signal comes from the lookback
+                # simulation; gate entries using the actual z-score to avoid
+                # acting on stale continuation signals carried over from the
+                # lookback window.
                 prev_bar_ts = bars[bar_idx - 1] if bar_idx > 0 else None
                 prev_sig = (
                     sig_map.get((ticker_a, ticker_b, prev_bar_ts), 0)
@@ -461,6 +495,13 @@ def run_backtest(
                 )
                 if prev_sig != 0:
                     continue
+
+                if bar_idx == 0:
+                    # Verify the z-score actually crossed the entry threshold
+                    # on this bar (not a stale carry-over from prior day).
+                    z_now = zscore_map.get((ticker_a, ticker_b, bar_ts))
+                    if z_now is None or abs(z_now) < z_entry:
+                        continue
 
                 # Execute at midpoint of next bar
                 bars_a = bar_lookup.get(ticker_a, {})
@@ -490,6 +531,7 @@ def run_backtest(
                     ticker_a=ticker_a,
                     ticker_b=ticker_b,
                     p_value=pair_row["p_value"],
+                    entry_day_idx=day_idx,
                 )
 
         portfolio_value += day_net_pnl

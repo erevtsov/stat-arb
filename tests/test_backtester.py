@@ -473,11 +473,12 @@ class TestRecommendedParams:
             assert trades["direction"].is_in([1, -1]).all()
 
     def test_exit_reason_valid_values(self):
-        """exit_reason must be 'signal' or 'eod'."""
+        """exit_reason must be one of the known exit types."""
         signals = _make_trade_signals_df("A", "B", [0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0])
         trades, _ = self._run(signals)
         if len(trades) > 0:
-            assert trades["exit_reason"].is_in(["signal", "eod"]).all()
+            valid = ["z_exit", "z_stop", "eod", "max_hold"]
+            assert trades["exit_reason"].is_in(valid).all()
 
     def test_entry_time_before_exit_time(self):
         """Every trade must have entry_time < exit_time."""
