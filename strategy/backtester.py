@@ -363,12 +363,17 @@ def run_backtest(
                 # Force-close only on: last bar of last trading day, OR max hold exceeded.
                 # Regular EOD (non-final days) does NOT force close — positions carry overnight.
                 max_hold_exceeded = (day_idx - pos.entry_day_idx) >= max_holding_days
-                should_exit = (is_last_bar and is_last_trading_day) or (is_last_bar and max_hold_exceeded)
+                force_close = (is_last_bar and is_last_trading_day) or (is_last_bar and max_hold_exceeded)
+                should_exit = force_close
 
-                if not should_exit:
+                if not should_exit and not is_last_bar:
                     # Check if signal went to 0 (mean reversion or stop loss).
                     # On bar_idx=0, use pos.direction as the "previous" signal
                     # since we know a position is already open.
+                    # Skip this check on the last bar of non-final days: the
+                    # correct execution would be at next bar (next trading day's
+                    # open), so carry overnight instead of falling back to the
+                    # current bar's midpoint.
                     prev_bar_ts = bars[bar_idx - 1] if bar_idx > 0 else None
                     prev_sig = (
                         sig_map.get((ticker_a, ticker_b, prev_bar_ts), 0)
@@ -376,13 +381,19 @@ def run_backtest(
                         else pos.direction
                     )
                     if sig == 0 and prev_sig != 0:
+                        # Signal cleared: z_exit or z_stop fired.
+                        should_exit = True
+                    elif sig != 0 and prev_sig != 0 and sig != pos.direction:
+                        # Direction flip: z crossed z_exit then z_entry in the
+                        # opposite direction within one bar (rare but possible
+                        # overnight).  Exit on the next bar — our position is now
+                        # wrong-way relative to the new signal.
                         should_exit = True
 
                 if not should_exit:
                     continue
 
                 # Determine exit price and reason
-                force_close = (is_last_bar and is_last_trading_day) or (is_last_bar and max_hold_exceeded)
                 if force_close:
                     exit_reason = "max_hold" if max_hold_exceeded else "eod"
                     bars_a = bar_lookup.get(ticker_a, {})
