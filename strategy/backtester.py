@@ -151,6 +151,38 @@ def _build_bar_lookup(
     return lookup
 
 
+def _get_exec_price(
+    exec_bar_lookup: dict[str, dict[Any, dict]],
+    ticker: str,
+    next_bar_ts: Any,
+    execution_lag_minutes: int,
+    execution_price_field: str,
+) -> float | None:
+    """
+    Look up the execution price from a 1-min bar lookup.
+
+    Args:
+        exec_bar_lookup:       1-min bar lookup built by _build_bar_lookup().
+        ticker:                Ticker symbol.
+        next_bar_ts:           Timestamp of the next signal-timeframe bar
+                               (i.e., the bar after the signal fires).
+        execution_lag_minutes: Minutes after next_bar_ts to look up.
+                               0 = first 1-min bar of the next bar period.
+        execution_price_field: OHLC field or "mid" ((high + low) / 2).
+
+    Returns:
+        Price as float, or None if the 1-min bar is not found (caller should
+        fall back to the signal-timeframe midpoint).
+    """
+    exec_ts = next_bar_ts + dt.timedelta(minutes=execution_lag_minutes)
+    bar = exec_bar_lookup.get(ticker, {}).get(exec_ts)
+    if bar is None:
+        return None
+    if execution_price_field == "mid":
+        return (bar["high"] + bar["low"]) / 2.0
+    return float(bar[execution_price_field])
+
+
 # ---------------------------------------------------------------------------
 # Main backtest entry point
 # ---------------------------------------------------------------------------
@@ -169,33 +201,45 @@ def run_backtest(
     cost_bps: float | None = None,
     min_bars_remaining: int = 8,
     max_holding_days: int = 5,
+    execution_lag_minutes: int | None = None,
+    execution_price_field: str = "open",
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """
     Run the full intraday pairs-trading backtest.
 
     Args:
-        start_date:           First trading day (YYYY-MM-DD).
-        end_date:             Last trading day (YYYY-MM-DD).
-        timeframe:            Bar frequency (e.g., "15min").
-        rolling_window_days:  Calendar days for the formation window.
-                              Defaults to CONFIG.cointegration.rolling_window_days.
-        z_entry:              Entry z-score threshold. Defaults to CONFIG.signal.z_entry.
-        z_exit:               Exit z-score threshold. Defaults to CONFIG.signal.z_exit.
-        z_stop:               Stop-loss threshold. Defaults to CONFIG.signal.z_stop.
-        max_pairs:            Max simultaneous open positions.
-                              Defaults to CONFIG.portfolio.max_pairs.
-        capital:              Starting portfolio value.
-                              Defaults to CONFIG.portfolio.capital.
-        cost_bps:             One-way cost per leg in bps.
-                              Defaults to CONFIG.portfolio.transaction_cost_bps.
-        min_bars_remaining:   Minimum bars that must remain in the trading day
-                              after the entry execution bar.  Prevents late-day
-                              entries that have no time for mean reversion.
-                              Default 8 bars (2 hours at 15-min).
-        max_holding_days:     Maximum calendar days a position may be held before
-                              forced close.  Default 5 days.  Positions that have
-                              not hit z_exit or z_stop are allowed to carry
-                              overnight so the spread has time to mean-revert.
+        start_date:             First trading day (YYYY-MM-DD).
+        end_date:               Last trading day (YYYY-MM-DD).
+        timeframe:              Bar frequency (e.g., "15min").
+        rolling_window_days:    Calendar days for the formation window.
+                                Defaults to CONFIG.cointegration.rolling_window_days.
+        z_entry:                Entry z-score threshold. Defaults to CONFIG.signal.z_entry.
+        z_exit:                 Exit z-score threshold. Defaults to CONFIG.signal.z_exit.
+        z_stop:                 Stop-loss threshold. Defaults to CONFIG.signal.z_stop.
+        max_pairs:              Max simultaneous open positions.
+                                Defaults to CONFIG.portfolio.max_pairs.
+        capital:                Starting portfolio value.
+                                Defaults to CONFIG.portfolio.capital.
+        cost_bps:               One-way cost per leg in bps.
+                                Defaults to CONFIG.portfolio.transaction_cost_bps.
+        min_bars_remaining:     Minimum bars that must remain in the trading day
+                                after the entry execution bar.  Prevents late-day
+                                entries that have no time for mean reversion.
+                                Default 8 bars (2 hours at 15-min).
+        max_holding_days:       Maximum calendar days a position may be held before
+                                forced close.  Default 5 days.  Positions that have
+                                not hit z_exit or z_stop are allowed to carry
+                                overnight so the spread has time to mean-revert.
+        execution_lag_minutes:  Minutes after the start of the next signal-timeframe
+                                bar at which the order fills.  Requires 1-min
+                                processed data on disk.  None (default) keeps the
+                                existing behaviour: midpoint of the next
+                                signal-timeframe bar.  0 = open of the first 1-min
+                                bar of the execution window; 5 = price 5 minutes in.
+        execution_price_field:  Which field of the 1-min bar to use when
+                                execution_lag_minutes is not None.  One of
+                                "open", "high", "low", "close", "mid"
+                                (mid = (high + low) / 2).  Default "open".
 
     Returns:
         (trades_df, daily_pnl_df) — see module docstring for schemas.
@@ -328,6 +372,16 @@ def run_backtest(
 
         bar_lookup = _build_bar_lookup(day_prices)
 
+        # Load 1-min execution prices when requested.
+        # Only the current trading day is needed — all signal-based exits
+        # use next_bar_ts which is always within the current day.
+        if execution_lag_minutes is not None:
+            exec_prices_1min = _load_day_prices(all_tickers_today, day, day, "1min")
+            exec_bar_lookup: dict[str, dict[Any, dict]] = _build_bar_lookup(exec_prices_1min)
+        else:
+            exec_bar_lookup = {}
+
+
         # Get sorted unique bars for this day
         bars: list = sorted(signals_day["timestamp"].unique().to_list())
         n_bars_day = len(bars)
@@ -427,8 +481,26 @@ def run_backtest(
                         exit_price_a = (bar_a["high"] + bar_a["low"]) / 2.0
                         exit_price_b = (bar_b["high"] + bar_b["low"]) / 2.0
                     else:
-                        exit_price_a = (nbar_a["high"] + nbar_a["low"]) / 2.0
-                        exit_price_b = (nbar_b["high"] + nbar_b["low"]) / 2.0
+                        # Use 1-min execution price when requested; fall back
+                        # to signal-timeframe midpoint if bar is missing.
+                        p_a = (
+                            _get_exec_price(
+                                exec_bar_lookup, ticker_a, next_bar_ts,
+                                execution_lag_minutes, execution_price_field,
+                            )
+                            if execution_lag_minutes is not None
+                            else None
+                        )
+                        p_b = (
+                            _get_exec_price(
+                                exec_bar_lookup, ticker_b, next_bar_ts,
+                                execution_lag_minutes, execution_price_field,
+                            )
+                            if execution_lag_minutes is not None
+                            else None
+                        )
+                        exit_price_a = p_a if p_a is not None else (nbar_a["high"] + nbar_a["low"]) / 2.0
+                        exit_price_b = p_b if p_b is not None else (nbar_b["high"] + nbar_b["low"]) / 2.0
 
                 gross, cost, net = _compute_pnl(
                     pos, exit_price_a, exit_price_b, cost_bps
@@ -514,7 +586,8 @@ def run_backtest(
                     if z_now is None or abs(z_now) < z_entry:
                         continue
 
-                # Execute at midpoint of next bar
+                # Execute at next bar — use 1-min price when requested,
+                # fall back to signal-timeframe midpoint if bar is missing.
                 bars_a = bar_lookup.get(ticker_a, {})
                 bars_b = bar_lookup.get(ticker_b, {})
                 nbar_a = bars_a.get(next_bar_ts)
@@ -522,8 +595,20 @@ def run_backtest(
                 if nbar_a is None or nbar_b is None:
                     continue
 
-                entry_price_a = (nbar_a["high"] + nbar_a["low"]) / 2.0
-                entry_price_b = (nbar_b["high"] + nbar_b["low"]) / 2.0
+                if execution_lag_minutes is not None:
+                    p_a = _get_exec_price(
+                        exec_bar_lookup, ticker_a, next_bar_ts,
+                        execution_lag_minutes, execution_price_field,
+                    )
+                    p_b = _get_exec_price(
+                        exec_bar_lookup, ticker_b, next_bar_ts,
+                        execution_lag_minutes, execution_price_field,
+                    )
+                    entry_price_a = p_a if p_a is not None else (nbar_a["high"] + nbar_a["low"]) / 2.0
+                    entry_price_b = p_b if p_b is not None else (nbar_b["high"] + nbar_b["low"]) / 2.0
+                else:
+                    entry_price_a = (nbar_a["high"] + nbar_a["low"]) / 2.0
+                    entry_price_b = (nbar_b["high"] + nbar_b["low"]) / 2.0
 
                 if entry_price_a <= 0 or entry_price_b <= 0:
                     continue

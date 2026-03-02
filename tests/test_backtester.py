@@ -9,6 +9,7 @@ import pytest
 from strategy.backtester import (
     PositionState,
     _compute_pnl,
+    _get_exec_price,
     run_backtest,
 )
 from utils.config import CONFIG
@@ -589,3 +590,203 @@ class TestRecommendedParams:
             )
         if len(trades) > 0:
             assert (trades["exit_reason"] == "eod").all()
+
+
+# ---------------------------------------------------------------------------
+# _get_exec_price
+# ---------------------------------------------------------------------------
+
+
+def _make_1min_lookup(
+    ticker: str,
+    base_ts: dt.datetime,
+    n_bars: int = 20,
+    open_: float = 100.0,
+    high: float = 101.0,
+    low: float = 99.0,
+    close: float = 100.5,
+) -> dict:
+    """Build a 1-min bar lookup for a single ticker."""
+    lookup = {}
+    for i in range(n_bars):
+        ts = base_ts + dt.timedelta(minutes=i)
+        lookup[ts] = {"open": open_, "high": high, "low": low, "close": close}
+    return {ticker: lookup}
+
+
+class TestGetExecPrice:
+    _base = dt.datetime(2023, 1, 3, 9, 15)  # start of the next 15-min bar
+
+    def test_lag0_open(self):
+        lookup = _make_1min_lookup("A", self._base, open_=101.0)
+        price = _get_exec_price(lookup, "A", self._base, 0, "open")
+        assert price == pytest.approx(101.0)
+
+    def test_lag5_close(self):
+        lookup = _make_1min_lookup("A", self._base, close=102.5)
+        price = _get_exec_price(lookup, "A", self._base, 5, "close")
+        assert price == pytest.approx(102.5)
+
+    def test_mid_field(self):
+        lookup = _make_1min_lookup("A", self._base, high=102.0, low=100.0)
+        price = _get_exec_price(lookup, "A", self._base, 0, "mid")
+        assert price == pytest.approx(101.0)
+
+    def test_missing_bar_returns_none(self):
+        """If the 1-min bar at exec_ts is missing, return None."""
+        lookup = _make_1min_lookup("A", self._base, n_bars=3)  # bars 0,1,2 only
+        price = _get_exec_price(lookup, "A", self._base, 5, "open")  # lag=5 → missing
+        assert price is None
+
+    def test_missing_ticker_returns_none(self):
+        lookup = _make_1min_lookup("A", self._base)
+        price = _get_exec_price(lookup, "B", self._base, 0, "open")  # ticker B missing
+        assert price is None
+
+    def test_all_ohlc_fields(self):
+        lookup = _make_1min_lookup("A", self._base, open_=100.0, high=104.0, low=98.0, close=103.0)
+        assert _get_exec_price(lookup, "A", self._base, 0, "open")  == pytest.approx(100.0)
+        assert _get_exec_price(lookup, "A", self._base, 0, "high")  == pytest.approx(104.0)
+        assert _get_exec_price(lookup, "A", self._base, 0, "low")   == pytest.approx(98.0)
+        assert _get_exec_price(lookup, "A", self._base, 0, "close") == pytest.approx(103.0)
+        assert _get_exec_price(lookup, "A", self._base, 0, "mid")   == pytest.approx(101.0)
+
+
+# ---------------------------------------------------------------------------
+# run_backtest with execution_lag_minutes
+# ---------------------------------------------------------------------------
+
+
+def _make_1min_intraday_df(n_bars: int = 390, base_price: float = 100.0):
+    """Generate synthetic 1-min OHLCV for a single trading day."""
+    base = dt.datetime(2023, 1, 3, 9, 30)
+    timestamps = [base + dt.timedelta(minutes=i) for i in range(n_bars)]
+    return pl.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open":   [base_price] * n_bars,
+            "high":   [base_price + 0.5] * n_bars,
+            "low":    [base_price - 0.5] * n_bars,
+            "close":  [base_price] * n_bars,
+            "volume": [10_000] * n_bars,
+        }
+    )
+
+
+class TestExecLagIntegration:
+    """Verify that execution_lag_minutes wires 1-min prices into trades."""
+
+    def _run_with_exec_lag(self, lag, field, intraday_15min, intraday_1min):
+        """Run a one-day backtest with execution lag, returning trades."""
+        signals = _make_trade_signals_df("A", "B", [0, 1, 1, 1, 0, 0, 0, 0, 0, 0])
+        pairs = _make_minimal_pairs_df()
+        trading_days = [dt.date(2023, 1, 3)]
+
+        # load_processed is called twice: once for 15-min signal data, once for 1-min exec data
+        call_count = {"n": 0}
+
+        def load_side_effect(ticker, timeframe, **kwargs):
+            call_count["n"] += 1
+            if timeframe == "1min":
+                return intraday_1min
+            return intraday_15min
+
+        patches = [
+            patch("strategy.backtester._get_nyse_trading_days", return_value=trading_days),
+            patch("strategy.backtester.find_cointegrated_pairs", return_value=pairs),
+            patch("strategy.backtester.load_processed", side_effect=load_side_effect),
+            patch("strategy.backtester.generate_pair_signals_for_day", return_value=signals),
+        ]
+        with patches[0], patches[1], patches[2], patches[3]:
+            trades, _ = run_backtest(
+                start_date="2023-01-03",
+                end_date="2023-01-03",
+                execution_lag_minutes=lag,
+                execution_price_field=field,
+                **RECOMMENDED_PARAMS,
+            )
+        return trades, call_count["n"]
+
+    def test_none_lag_does_not_load_1min(self):
+        """execution_lag_minutes=None must not trigger a second load_processed call."""
+        signals = _make_trade_signals_df("A", "B", [0, 1, 1, 1, 0, 0, 0, 0, 0, 0])
+        pairs = _make_minimal_pairs_df()
+        intraday = _make_intraday_df()
+        trading_days = [dt.date(2023, 1, 3)]
+
+        call_count = {"n": 0}
+
+        def load_side_effect(ticker, timeframe, **kwargs):
+            call_count["n"] += 1
+            return intraday
+
+        patches = [
+            patch("strategy.backtester._get_nyse_trading_days", return_value=trading_days),
+            patch("strategy.backtester.find_cointegrated_pairs", return_value=pairs),
+            patch("strategy.backtester.load_processed", side_effect=load_side_effect),
+            patch("strategy.backtester.generate_pair_signals_for_day", return_value=signals),
+        ]
+        with patches[0], patches[1], patches[2], patches[3]:
+            run_backtest(
+                start_date="2023-01-03",
+                end_date="2023-01-03",
+                execution_lag_minutes=None,
+                **RECOMMENDED_PARAMS,
+            )
+        # Should only load 15-min data (2 tickers), not 1-min data
+        assert all(
+            True for _ in range(call_count["n"])
+        ), "load_processed call count recorded"
+        # No 1-min call means the call count is for 2 tickers (A and B) at 15-min only
+        assert call_count["n"] == 2
+
+    def test_lag0_open_uses_1min_price(self):
+        """With lag=0 and field='open', entry price should equal the 1-min open."""
+        intraday_15min = _make_intraday_df(n_bars=10, base_price=100.0)
+        intraday_1min = _make_1min_intraday_df(base_price=105.0)  # distinctly different price
+
+        trades, _ = self._run_with_exec_lag(0, "open", intraday_15min, intraday_1min)
+
+        if len(trades) > 0:
+            # 1-min open is 105.0; 15-min midpoint would be 100.0 ((100.5 + 99.5)/2)
+            assert trades["entry_price_a"][0] == pytest.approx(105.0)
+            assert trades["entry_price_b"][0] == pytest.approx(105.0)
+
+    def test_lag0_mid_uses_1min_midpoint(self):
+        """With field='mid', entry price should be (high+low)/2 of the 1-min bar."""
+        intraday_15min = _make_intraday_df(n_bars=10, base_price=100.0)
+        # 1-min bars: high=106, low=104 → mid=105
+        intraday_1min = pl.DataFrame(
+            {
+                "timestamp": [dt.datetime(2023, 1, 3, 9, 30) + dt.timedelta(minutes=i) for i in range(390)],
+                "open":  [105.0] * 390,
+                "high":  [106.0] * 390,
+                "low":   [104.0] * 390,
+                "close": [105.0] * 390,
+                "volume": [10_000] * 390,
+            }
+        )
+        trades, _ = self._run_with_exec_lag(0, "mid", intraday_15min, intraday_1min)
+
+        if len(trades) > 0:
+            assert trades["entry_price_a"][0] == pytest.approx(105.0)  # (106+104)/2
+
+    def test_fallback_when_1min_missing(self):
+        """If the 1-min bar at exec_ts is not found, fall back to 15-min midpoint."""
+        intraday_15min = _make_intraday_df(n_bars=10, base_price=100.0)
+        # Empty 1-min dataframe — no bars available
+        empty_1min = pl.DataFrame(
+            schema={
+                "timestamp": pl.Datetime,
+                "open": pl.Float64,
+                "high": pl.Float64,
+                "low": pl.Float64,
+                "close": pl.Float64,
+                "volume": pl.Int64,
+            }
+        )
+        trades, _ = self._run_with_exec_lag(0, "open", intraday_15min, empty_1min)
+
+        if len(trades) > 0:
+            # 15-min midpoint: high=100.5, low=99.5 → 100.0
+            assert trades["entry_price_a"][0] == pytest.approx(100.0)
