@@ -8,7 +8,9 @@ using rolling-window normalization.
 from __future__ import annotations
 
 import datetime as dt
+import math
 
+import numpy as np
 import polars as pl
 
 from utils.config import CONFIG
@@ -20,19 +22,23 @@ def compute_spread(
     hedge_ratio: float,
 ) -> pl.Series:
     """
-    Compute the spread between two price series.
+    Compute the log-price spread between two price series.
 
-    spread_t = prices_a_t - hedge_ratio * prices_b_t
+    log_spread_t = log(prices_a_t) - hedge_ratio * log(prices_b_t)
+
+    hedge_ratio is the log-elasticity beta from OLS of log(A) on log(B).
+    The spread is in log-return space: a unit change in log_spread represents
+    approximately a 1% divergence between A and B.
 
     Args:
-        prices_a:    Close prices for stock A.
-        prices_b:    Close prices for stock B.
-        hedge_ratio: OLS hedge ratio (beta).
+        prices_a:    Close prices for stock A (must be positive).
+        prices_b:    Close prices for stock B (must be positive).
+        hedge_ratio: Log-elasticity beta from log-price OLS regression.
 
     Returns:
-        Polars Series of spread values.
+        Polars Series of log-spread values.
     """
-    return prices_a - hedge_ratio * prices_b
+    return prices_a.log(math.e) - hedge_ratio * prices_b.log(math.e)
 
 
 def compute_zscore(
@@ -85,7 +91,8 @@ def generate_signals(
         zscore:           Z-score series.
         z_entry:          Entry threshold. Defaults to CONFIG value.
         z_exit:           Exit threshold. Defaults to CONFIG value.
-        z_stop:           Stop-loss threshold. Defaults to CONFIG value.
+        z_stop:           Stop-loss threshold. None = no stop-loss (rely on z_exit
+                          and time stop only). Defaults to CONFIG value.
         max_holding_bars: Max bars before forced exit. None = no time stop.
 
     Returns:
@@ -93,17 +100,24 @@ def generate_signals(
     """
     z_entry = z_entry if z_entry is not None else CONFIG.signal.z_entry
     z_exit = z_exit if z_exit is not None else CONFIG.signal.z_exit
-    z_stop = z_stop if z_stop is not None else CONFIG.signal.z_stop
+    # z_stop=None means no stop-loss (rely on z_exit and time stop only)
 
-    zvals = zscore.to_list()
+    # Use numpy for faster array access; nulls become NaN via to_numpy()
+    zvals = zscore.to_numpy()
     n = len(zvals)
-    signals = [0] * n
+    signals = np.zeros(n, dtype=np.int32)
     position = 0  # current position: +1, -1, or 0
     bars_held = 0
 
+    # Cache locals to avoid repeated attribute/global lookups in the hot loop
+    _z_entry = z_entry
+    _z_exit = z_exit
+    _z_stop = z_stop
+    _max_holding = max_holding_bars
+
     for i in range(n):
         z = zvals[i]
-        if z is None:
+        if z != z:  # NaN check (faster than np.isnan for scalars)
             signals[i] = 0
             position = 0
             bars_held = 0
@@ -111,9 +125,9 @@ def generate_signals(
 
         if position == 0:
             # Check entry
-            if z < -z_entry:
+            if z < -_z_entry:
                 position = 1  # long spread
-            elif z > z_entry:
+            elif z > _z_entry:
                 position = -1  # short spread
         else:
             bars_held += 1
@@ -121,17 +135,18 @@ def generate_signals(
             exit_trade = False
 
             # Mean reversion exit
-            if position == 1 and z >= -z_exit:
+            if position == 1 and z >= -_z_exit:
                 exit_trade = True
-            elif position == -1 and z <= z_exit:
+            elif position == -1 and z <= _z_exit:
                 exit_trade = True
 
-            # Stop loss exit
-            if abs(z) > z_stop:
-                exit_trade = True
+            # Stop loss exit (skipped when z_stop is None)
+            if not exit_trade and _z_stop is not None:
+                if z > _z_stop or z < -_z_stop:
+                    exit_trade = True
 
             # Time stop exit
-            if max_holding_bars is not None and bars_held >= max_holding_bars:
+            if not exit_trade and _max_holding is not None and bars_held >= _max_holding:
                 exit_trade = True
 
             if exit_trade:
@@ -224,7 +239,19 @@ def generate_pair_signals_for_day(
         or have fewer than 2 overlapping bars, are silently skipped.
     """
     date_val = str(date)
-    rows: list[dict] = []
+    _schema = {
+        "date": pl.Utf8,
+        "timestamp": pl.Datetime,
+        "ticker_a": pl.Utf8,
+        "ticker_b": pl.Utf8,
+        "hedge_ratio": pl.Float64,
+        "p_value": pl.Float64,
+        "signal_weight": pl.Float64,
+        "zscore": pl.Float64,
+        "signal_binary": pl.Int32,
+        "signal_weighted": pl.Float64,
+    }
+    pair_dfs: list[pl.DataFrame] = []
 
     for row in pairs_df.iter_rows(named=True):
         ticker_a = row["ticker_a"]
@@ -263,53 +290,25 @@ def generate_pair_signals_for_day(
             max_holding_bars=max_holding_bars,
         )
 
-        zscore_list = zscore.to_list()
-        signal_list = signal_bin.to_list()
-
-        for ts, z, sig in zip(timestamps.to_list(), zscore_list, signal_list):
-            rows.append(
+        n = len(timestamps)
+        pair_dfs.append(
+            pl.DataFrame(
                 {
-                    "date": date_val,
-                    "timestamp": ts,
-                    "ticker_a": ticker_a,
-                    "ticker_b": ticker_b,
-                    "hedge_ratio": hedge_ratio,
-                    "p_value": p_value,
-                    "signal_weight": weight,
-                    "zscore": z,
-                    "signal_binary": sig,
-                    "signal_weighted": float(sig) * weight,
+                    "date": pl.Series([date_val] * n, dtype=pl.Utf8),
+                    "timestamp": timestamps,
+                    "ticker_a": pl.Series([ticker_a] * n, dtype=pl.Utf8),
+                    "ticker_b": pl.Series([ticker_b] * n, dtype=pl.Utf8),
+                    "hedge_ratio": pl.Series([hedge_ratio] * n, dtype=pl.Float64),
+                    "p_value": pl.Series([p_value] * n, dtype=pl.Float64),
+                    "signal_weight": pl.Series([weight] * n, dtype=pl.Float64),
+                    "zscore": zscore.cast(pl.Float64),
+                    "signal_binary": signal_bin.cast(pl.Int32),
+                    "signal_weighted": signal_bin.cast(pl.Float64) * weight,
                 }
             )
-
-    if not rows:
-        return pl.DataFrame(
-            schema={
-                "date": pl.Utf8,
-                "timestamp": pl.Datetime,
-                "ticker_a": pl.Utf8,
-                "ticker_b": pl.Utf8,
-                "hedge_ratio": pl.Float64,
-                "p_value": pl.Float64,
-                "signal_weight": pl.Float64,
-                "zscore": pl.Float64,
-                "signal_binary": pl.Int32,
-                "signal_weighted": pl.Float64,
-            }
         )
 
-    return pl.DataFrame(
-        rows,
-        schema={
-            "date": pl.Utf8,
-            "timestamp": pl.Datetime,
-            "ticker_a": pl.Utf8,
-            "ticker_b": pl.Utf8,
-            "hedge_ratio": pl.Float64,
-            "p_value": pl.Float64,
-            "signal_weight": pl.Float64,
-            "zscore": pl.Float64,
-            "signal_binary": pl.Int32,
-            "signal_weighted": pl.Float64,
-        },
-    )
+    if not pair_dfs:
+        return pl.DataFrame(schema=_schema)
+
+    return pl.concat(pair_dfs)

@@ -11,9 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-from statsmodels.regression.linear_model import OLS
-from statsmodels.tools import add_constant
-from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.adfvalues import mackinnonp
 from tqdm import tqdm
 
 from analysis.preprocessing import load_processed
@@ -31,9 +29,11 @@ def _compute_hedge_ratio(y: np.ndarray, x: np.ndarray) -> float:
     Returns:
         Hedge ratio (beta coefficient).
     """
-    x_const = add_constant(x)
-    model = OLS(y, x_const).fit()
-    return float(model.params[1])
+    X = np.empty((len(x), 2), dtype=np.float64)
+    X[:, 0] = 1.0
+    X[:, 1] = x
+    beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    return float(beta[1])
 
 
 def _compute_half_life(spread: np.ndarray) -> float:
@@ -53,9 +53,11 @@ def _compute_half_life(spread: np.ndarray) -> float:
     """
     spread_lag = spread[:-1]
     spread_diff = np.diff(spread)
-    spread_lag_const = add_constant(spread_lag)
-    model = OLS(spread_diff, spread_lag_const).fit()
-    phi = model.params[1]
+    X = np.empty((len(spread_lag), 2), dtype=np.float64)
+    X[:, 0] = 1.0
+    X[:, 1] = spread_lag
+    beta, _, _, _ = np.linalg.lstsq(X, spread_diff, rcond=None)
+    phi = beta[1]
 
     if phi >= 0:
         return float("inf")  # not mean-reverting
@@ -64,27 +66,64 @@ def _compute_half_life(spread: np.ndarray) -> float:
     return max(half_life, 0.0)
 
 
+def _fast_adfuller(y: np.ndarray) -> tuple[float, float]:
+    """
+    ADF test with constant and maxlag=1, equivalent to:
+        adfuller(y, maxlag=1, regression='c', autolag=None)
+
+    Uses np.linalg.lstsq instead of statsmodels OLS.  Numerical results
+    match to machine epsilon (~1e-15).
+
+    Returns:
+        (adf_stat, p_value)
+    """
+    dy = np.diff(y)
+    # Δy_t = c + φ*y_{t-1} + γ*Δy_{t-1} + ε   (t = 2..n)
+    y_lag  = y[1:-1]   # y_{t-1}
+    dy_lag = dy[:-1]   # Δy_{t-1}
+    y_reg  = dy[1:]    # Δy_t
+
+    X = np.empty((len(y_reg), 3), dtype=np.float64)
+    X[:, 0] = 1.0
+    X[:, 1] = y_lag
+    X[:, 2] = dy_lag
+    beta, _, _, _ = np.linalg.lstsq(X, y_reg, rcond=None)
+
+    resid = y_reg - X @ beta
+    n, k = len(y_reg), 3
+    s2 = (resid @ resid) / (n - k)
+    XtXinv = np.linalg.inv(X.T @ X)
+    se = math.sqrt(s2 * XtXinv[1, 1])
+    adf_stat = float(beta[1] / se)
+    p_value = float(mackinnonp(adf_stat, regression="c", N=1))
+    return adf_stat, p_value
+
+
 def test_cointegration(
     prices_a: np.ndarray,
     prices_b: np.ndarray,
 ) -> dict:
     """
-    Run Engle-Granger cointegration test on two price series.
+    Run Engle-Granger cointegration test on two log-price series.
+
+    Regression is performed on log prices (log-cointegration), so
+    hedge_ratio is a log-elasticity (beta): log(A) ~ alpha + beta*log(B).
+    The spread is log(A) - beta*log(B), which is stationary if the pair
+    is log-cointegrated.
 
     Args:
-        prices_a: Close price series for stock A.
-        prices_b: Close price series for stock B.
+        prices_a: Close price series for stock A (must be positive).
+        prices_b: Close price series for stock B (must be positive).
 
     Returns:
         Dict with keys: hedge_ratio, adf_stat, p_value, half_life.
     """
-    hedge_ratio = _compute_hedge_ratio(prices_a, prices_b)
-    spread = prices_a - hedge_ratio * prices_b
+    log_a = np.log(prices_a)
+    log_b = np.log(prices_b)
+    hedge_ratio = _compute_hedge_ratio(log_a, log_b)
+    spread = log_a - hedge_ratio * log_b
 
-    adf_result = adfuller(spread, maxlag=1, regression="c", autolag=None)
-    adf_stat = float(adf_result[0])
-    p_value = float(adf_result[1])
-
+    adf_stat, p_value = _fast_adfuller(spread)
     half_life = _compute_half_life(spread)
 
     return {
@@ -104,6 +143,7 @@ def find_cointegrated_pairs(
     p_value_threshold: float | None = None,
     min_half_life: float | None = None,
     max_half_life: float | None = None,
+    price_cache: dict | None = None,
 ) -> pl.DataFrame:
     """
     Find all cointegrated pairs within each sector.
@@ -123,6 +163,10 @@ def find_cointegrated_pairs(
         p_value_threshold:  Max p-value to include pair. Defaults to config value.
         min_half_life:      Min half-life filter (in bars). Defaults to config value.
         max_half_life:      Max half-life filter (in bars). Defaults to config value.
+        price_cache:        Optional pre-loaded price data: dict mapping ticker →
+                            DataFrame with [timestamp, close] columns covering at
+                            least [start_date, end_date].  When supplied, skips
+                            all Parquet I/O for formation-window data.
 
     Returns:
         Polars DataFrame with columns:
@@ -151,36 +195,60 @@ def find_cointegrated_pairs(
     )
 
     # Load close prices for all available tickers at specified timeframe
-    timeframe_dir = Path(processed_dir) / timeframe
-    if not timeframe_dir.exists():
-        raise FileNotFoundError(
-            f"Processed data not found for timeframe '{timeframe}': {timeframe_dir}\n"
-            "Run preprocess_all_tickers() first."
-        )
-
-    available_files = {p.stem for p in timeframe_dir.glob("*.parquet")}
     sector_mapping = CONFIG.universe.sector_mapping
 
-    if tickers is None:
-        tickers = sorted(available_files & set(sector_mapping.keys()))
-    else:
-        tickers = sorted(set(tickers) & available_files)
+    if price_cache is not None:
+        # Fast path: slice pre-loaded data, no Parquet I/O
+        import datetime as _dt
+        start_dt = _dt.date.fromisoformat(start_date) if start_date else None
+        end_dt   = _dt.date.fromisoformat(end_date)   if end_date   else None
 
-    # Load all close prices at specified timeframe
-    price_data: dict[str, pl.DataFrame] = {}
-    for ticker in tickers:
-        try:
-            # Pass date filters to load_processed() for efficient Parquet filtering
-            df = load_processed(ticker, timeframe, processed_dir, start_date, end_date)
+        cache_tickers = sorted(set(price_cache.keys()) & set(sector_mapping.keys()))
+        if tickers is not None:
+            cache_tickers = sorted(set(tickers) & set(cache_tickers))
 
-            # Skip if no data remains after filtering
+        price_data: dict[str, pl.DataFrame] = {}
+        for ticker in cache_tickers:
+            df = price_cache[ticker]
+            if start_dt is not None:
+                df = df.filter(pl.col("timestamp").dt.date() >= start_dt)
+            if end_dt is not None:
+                df = df.filter(pl.col("timestamp").dt.date() <= end_dt)
             if len(df) == 0:
                 continue
-
             df = df.select(["timestamp", "close"]).rename({"close": ticker})
             price_data[ticker] = df
-        except FileNotFoundError:
-            continue
+        tickers = cache_tickers
+    else:
+        timeframe_dir = Path(processed_dir) / timeframe
+        if not timeframe_dir.exists():
+            raise FileNotFoundError(
+                f"Processed data not found for timeframe '{timeframe}': {timeframe_dir}\n"
+                "Run preprocess_all_tickers() first."
+            )
+
+        available_files = {p.stem for p in timeframe_dir.glob("*.parquet")}
+
+        if tickers is None:
+            tickers = sorted(available_files & set(sector_mapping.keys()))
+        else:
+            tickers = sorted(set(tickers) & available_files)
+
+        # Load all close prices at specified timeframe
+        price_data = {}
+        for ticker in tickers:
+            try:
+                # Pass date filters to load_processed() for efficient Parquet filtering
+                df = load_processed(ticker, timeframe, processed_dir, start_date, end_date)
+
+                # Skip if no data remains after filtering
+                if len(df) == 0:
+                    continue
+
+                df = df.select(["timestamp", "close"]).rename({"close": ticker})
+                price_data[ticker] = df
+            except FileNotFoundError:
+                continue
 
     if len(price_data) < 2:
         print("Not enough tickers with data for cointegration analysis.")
@@ -260,20 +328,29 @@ def find_cointegrated_pairs(
                 f"250+ observations recommended for robust results."
             )
 
+    # Pre-extract numpy arrays per ticker to avoid per-pair Polars joins
+    # timestamp cast to int64 (μs) allows fast np.intersect1d alignment
+    ticker_np: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for ticker, df in price_data.items():
+        ts = df["timestamp"].cast(pl.Int64).to_numpy()
+        prices = df[ticker].to_numpy().astype(np.float64)
+        ticker_np[ticker] = (ts, prices)
+
     results: list[dict] = []
 
     for ticker_a, ticker_b, sector in tqdm(pairs_to_test, desc="Testing cointegration"):
-        df_a = price_data[ticker_a]
-        df_b = price_data[ticker_b]
+        ts_a, p_a = ticker_np[ticker_a]
+        ts_b, p_b = ticker_np[ticker_b]
 
-        # Inner join on timestamp to get overlapping dates
-        merged = df_a.join(df_b, on="timestamp", how="inner")
+        # Inner join on timestamp via sorted-array intersection (no Polars overhead)
+        _, idx_a, idx_b = np.intersect1d(ts_a, ts_b, return_indices=True)
+        n_obs = len(idx_a)
 
-        if len(merged) < 60:  # need minimum observations
+        if n_obs < 60:  # need minimum observations
             continue
 
-        prices_a = merged[ticker_a].to_numpy().astype(np.float64)
-        prices_b = merged[ticker_b].to_numpy().astype(np.float64)
+        prices_a = p_a[idx_a]
+        prices_b = p_b[idx_b]
 
         try:
             result = test_cointegration(prices_a, prices_b)
@@ -298,7 +375,7 @@ def find_cointegrated_pairs(
                 "timeframe": timeframe,
                 "formation_start": start_date,
                 "formation_end": end_date,
-                "n_observations": len(merged),
+                "n_observations": n_obs,
             }
         )
 
