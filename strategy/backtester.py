@@ -29,7 +29,7 @@ import polars as pl
 from analysis.cointegration import find_cointegrated_pairs
 from analysis.preprocessing import load_processed
 from analysis.signals import compute_pvalue_weights, generate_pair_signals_for_day
-from utils.config import CONFIG, MINUTES_PER_BAR, max_holding_bars, zscore_window_bars
+from utils.config import CONFIG, MINUTES_PER_BAR, get_all_tickers, max_holding_bars, zscore_window_bars
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -50,7 +50,6 @@ class PositionState:
     ticker_a: str
     ticker_b: str
     p_value: float
-    entry_day_idx: int = 0  # day index when position was opened (for max-hold)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +199,7 @@ def run_backtest(
     capital: float | None = None,
     cost_bps: float | None = None,
     min_bars_remaining: int = 8,
-    max_holding_days: int = 5,
+    max_holding_minutes: int = 120,
     execution_lag_minutes: int | None = None,
     execution_price_field: str = "open",
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -215,7 +214,8 @@ def run_backtest(
                                 Defaults to CONFIG.cointegration.rolling_window_days.
         z_entry:                Entry z-score threshold. Defaults to CONFIG.signal.z_entry.
         z_exit:                 Exit z-score threshold. Defaults to CONFIG.signal.z_exit.
-        z_stop:                 Stop-loss threshold. Defaults to CONFIG.signal.z_stop.
+        z_stop:                 Stop-loss threshold. None = no stop-loss (rely on
+                                z_exit and EOD close only). Defaults to CONFIG.signal.z_stop.
         max_pairs:              Max simultaneous open positions.
                                 Defaults to CONFIG.portfolio.max_pairs.
         capital:                Starting portfolio value.
@@ -226,10 +226,10 @@ def run_backtest(
                                 after the entry execution bar.  Prevents late-day
                                 entries that have no time for mean reversion.
                                 Default 8 bars (2 hours at 15-min).
-        max_holding_days:       Maximum calendar days a position may be held before
-                                forced close.  Default 5 days.  Positions that have
-                                not hit z_exit or z_stop are allowed to carry
-                                overnight so the spread has time to mean-revert.
+        max_holding_minutes:    Maximum intraday holding time in minutes before the
+                                signal generator issues a time-stop exit.  All
+                                positions are also force-closed at EOD every day
+                                (intraday-only mandate).  Default 120 minutes.
         execution_lag_minutes:  Minutes after the start of the next signal-timeframe
                                 bar at which the order fills.  Requires 1-min
                                 processed data on disk.  None (default) keeps the
@@ -250,7 +250,7 @@ def run_backtest(
     )
     z_entry = z_entry if z_entry is not None else CONFIG.signal.z_entry
     z_exit = z_exit if z_exit is not None else CONFIG.signal.z_exit
-    z_stop = z_stop if z_stop is not None else CONFIG.signal.z_stop
+    # z_stop=None → no stop-loss (pass None through to signal generator)
     max_pairs = max_pairs if max_pairs is not None else CONFIG.portfolio.max_pairs
     capital = capital if capital is not None else CONFIG.portfolio.capital
     cost_bps = (
@@ -260,8 +260,25 @@ def run_backtest(
     zscore_window = zscore_window_bars(timeframe)
     # Number of lookback trading days needed to warm up the z-score window
     zscore_lookback_days = CONFIG.signal.zscore_window_days + 1
+    max_holding_bars_val = max_holding_minutes // MINUTES_PER_BAR[timeframe]
 
     trading_days = _get_nyse_trading_days(start_date, end_date)
+
+    # Pre-load all universe prices for the full backtest span (including formation
+    # lookback) into memory.  Each day then slices from RAM instead of re-reading
+    # Parquet files, eliminating 100 × n_days disk reads.
+    cache_start = trading_days[0] - dt.timedelta(days=rolling_window_days + zscore_lookback_days + 5)
+    _price_cache: dict[str, pl.DataFrame] = _load_day_prices(
+        get_all_tickers(), cache_start, trading_days[-1], timeframe
+    )
+
+    # Chunk-based 1-min cache: loads 30 trading days at a time instead of one day
+    # at a time.  Bounds memory to O(chunk × tickers) regardless of history length,
+    # while eliminating ~95% of per-day parquet I/O (amortises 100 file opens over
+    # 30 days instead of 1).  At 300 tickers + 10 years the chunk stays ~165 MB.
+    _1MIN_CHUNK_DAYS = 30
+    _1min_chunk: dict[str, pl.DataFrame] = {}
+    _1min_chunk_through: dt.date = dt.date.min   # sentinel → triggers load on day 0
 
     portfolio_value = capital
     open_positions: dict[tuple[str, str], PositionState] = {}
@@ -272,12 +289,13 @@ def run_backtest(
         formation_start = day - dt.timedelta(days=rolling_window_days)
         formation_end = day - dt.timedelta(days=1)
 
-        # SOD: find cointegrated pairs for the formation window
+        # SOD: find cointegrated pairs for the formation window (cache avoids I/O)
         try:
             pairs_df = find_cointegrated_pairs(
                 start_date=str(formation_start),
                 end_date=str(formation_end),
                 timeframe=timeframe,
+                price_cache=_price_cache,
             )
         except Exception:
             pairs_df = None
@@ -304,11 +322,16 @@ def run_backtest(
             set(pairs_df["ticker_a"].to_list() + pairs_df["ticker_b"].to_list())
         )
 
-        # Load intraday prices with z-score lookback window.
-        # load_processed end_date is now inclusive (date comparison), so
-        # pass `day` directly — no +1 workaround needed.
+        # Slice intraday prices from the in-memory cache (no Parquet I/O).
         lookback_start = trading_days[max(0, day_idx - zscore_lookback_days)]
-        day_prices = _load_day_prices(all_tickers_today, lookback_start, day, timeframe)
+        day_prices = {
+            t: _price_cache[t].filter(
+                (pl.col("timestamp").dt.date() >= lookback_start)
+                & (pl.col("timestamp").dt.date() <= day)
+            )
+            for t in all_tickers_today
+            if t in _price_cache
+        }
 
         if not day_prices:
             daily_pnl_rows.append(
@@ -324,8 +347,8 @@ def run_backtest(
             continue
 
         # Generate signals for the full lookback + today.
-        # No time stop (max_holding_bars=None): positions run until the z_exit
-        # or z_stop signal fires, or until the EOD forced close below.
+        # max_holding_bars enforces an intraday time stop inside the signal
+        # generator; all remaining positions are also force-closed at EOD below.
         try:
             signals_day = generate_pair_signals_for_day(
                 pairs_df=pairs_df,
@@ -335,7 +358,7 @@ def run_backtest(
                 z_entry=z_entry,
                 z_exit=z_exit,
                 z_stop=z_stop,
-                max_holding_bars=None,
+                max_holding_bars=max_holding_bars_val,
             )
         except Exception:
             daily_pnl_rows.append(
@@ -376,7 +399,19 @@ def run_backtest(
         # Only the current trading day is needed — all signal-based exits
         # use next_bar_ts which is always within the current day.
         if execution_lag_minutes is not None:
-            exec_prices_1min = _load_day_prices(all_tickers_today, day, day, "1min")
+            # Reload chunk when the current day has advanced past it
+            if day > _1min_chunk_through:
+                chunk_end_idx = min(day_idx + _1MIN_CHUNK_DAYS - 1, len(trading_days) - 1)
+                _1min_chunk_through = trading_days[chunk_end_idx]
+                _1min_chunk = _load_day_prices(
+                    get_all_tickers(), day, _1min_chunk_through, "1min"
+                )
+            # Per-day slice from chunk: no parquet I/O, just a DataFrame filter
+            exec_prices_1min = {
+                t: df.filter(pl.col("timestamp").dt.date() == day)
+                for t, df in _1min_chunk.items()
+                if t in set(all_tickers_today)
+            }
             exec_bar_lookup: dict[str, dict[Any, dict]] = _build_bar_lookup(exec_prices_1min)
         else:
             exec_bar_lookup = {}
@@ -403,7 +438,6 @@ def run_backtest(
 
         for bar_idx, bar_ts in enumerate(bars):
             is_last_bar = bar_idx == n_bars_day - 1
-            is_last_trading_day = day_idx == len(trading_days) - 1
             next_bar_ts = bars[bar_idx + 1] if not is_last_bar else None
 
             # --- Exit checks (existing positions) ---
@@ -414,10 +448,8 @@ def run_backtest(
                 sig = sig_map.get((ticker_a, ticker_b, bar_ts), 0)
 
                 # Determine if we should exit
-                # Force-close only on: last bar of last trading day, OR max hold exceeded.
-                # Regular EOD (non-final days) does NOT force close — positions carry overnight.
-                max_hold_exceeded = (day_idx - pos.entry_day_idx) >= max_holding_days
-                force_close = (is_last_bar and is_last_trading_day) or (is_last_bar and max_hold_exceeded)
+                # Intraday-only: force-close all positions at EOD every day.
+                force_close = is_last_bar
                 should_exit = force_close
 
                 if not should_exit and not is_last_bar:
@@ -449,7 +481,7 @@ def run_backtest(
 
                 # Determine exit price and reason
                 if force_close:
-                    exit_reason = "max_hold" if max_hold_exceeded else "eod"
+                    exit_reason = "eod"
                     bars_a = bar_lookup.get(ticker_a, {})
                     bars_b = bar_lookup.get(ticker_b, {})
                     bar_a = bars_a.get(bar_ts)
@@ -461,9 +493,27 @@ def run_backtest(
                     exit_price_b = bar_b["close"]
                 else:
                     # Infer granular exit reason from z-score at the exit bar.
+                    # The signal generator counts bars_held starting at the bar
+                    # AFTER the entry signal, but pos.entry_time is next_bar_ts
+                    # (one bar later).  So when the time stop fires after
+                    # max_holding_bars_val bars, elapsed from pos.entry_time is
+                    # (max_holding_bars_val - 1) bar-intervals, not
+                    # max_holding_minutes.  Use (max_holding_bars_val - 1) bars
+                    # as the threshold to correctly detect time-stop exits.
+                    elapsed_minutes = (
+                        bar_ts - pos.entry_time
+                    ).total_seconds() / 60.0
+                    minutes_per_bar = MINUTES_PER_BAR[timeframe]
+                    max_hold_threshold = (max_holding_bars_val - 1) * minutes_per_bar
                     z_at_exit = zscore_map.get((ticker_a, ticker_b, bar_ts))
-                    if z_at_exit is not None and abs(z_at_exit) > z_stop:
+                    if (
+                        z_stop is not None
+                        and z_at_exit is not None
+                        and abs(z_at_exit) > z_stop
+                    ):
                         exit_reason = "z_stop"
+                    elif elapsed_minutes >= max_hold_threshold:
+                        exit_reason = "max_hold"
                     else:
                         exit_reason = "z_exit"
 
@@ -627,7 +677,6 @@ def run_backtest(
                     ticker_a=ticker_a,
                     ticker_b=ticker_b,
                     p_value=pair_row["p_value"],
-                    entry_day_idx=day_idx,
                 )
 
         portfolio_value += day_net_pnl

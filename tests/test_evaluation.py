@@ -1,6 +1,7 @@
 """Tests for analysis/evaluation.py."""
 
 import datetime as dt
+import math
 
 import polars as pl
 import pytest
@@ -75,22 +76,19 @@ class TestComputeForwardReturns:
             "B": _make_prices([100.0] * 6),
         }
 
-    def test_long_spread_zero_spread_returns_null(self):
-        """When spread at t is exactly 0 (division guard), return is null."""
-        # setup: closes_a[0]=100, closes_b[0]=100 with hedge_ratio=1 → spread=0
+    def test_long_spread_zero_spread_still_computes(self):
+        """Log-spread=0 at t (prices equal) is not a guard; log difference is the return."""
+        # A[0]=100, B[0]=100, hr=1 → log_spread_0 = log(100) - log(100) = 0
+        # A[3]=103, B[3]=100 → log_spread_3 = log(103) - log(100) = log(1.03)
+        # fwd = 1 * (log(1.03) - 0) = log(1.03)
         signals_df = pl.DataFrame(
             [_make_signals_row("A", "B", bar=0, signal_binary=1)]
         )
         result = compute_forward_returns(signals_df, self.prices, n_bars=3)
         fwd = result["fwd_return_gross"][0]
-        assert fwd is None
+        assert fwd == pytest.approx(math.log(103 / 100), abs=1e-9)
 
     def test_long_spread_positive_when_spread_rises(self):
-        prices = {
-            "A": _make_prices([100.0, 101.0, 103.0, 106.0]),
-            "B": _make_prices([100.0] * 4),
-        }
-        # spread_0 = 0, adjust: use hedge_ratio != 1
         prices2 = {
             "A": _make_prices([105.0, 106.0, 107.0, 110.0]),
             "B": _make_prices([100.0] * 4),
@@ -100,9 +98,9 @@ class TestComputeForwardReturns:
         )
         result = compute_forward_returns(signals_df, prices2, n_bars=2)
         fwd = result["fwd_return_gross"][0]
-        # spread_0 = 105 - 100 = 5; spread_2 = 107 - 100 = 7
-        # fwd = 1 * (7 - 5) / 5 = 0.4
-        assert fwd == pytest.approx(0.4, abs=1e-9)
+        # log_spread_0 = log(105) - log(100); log_spread_2 = log(107) - log(100)
+        # fwd = log(107) - log(105) = log(107/105)
+        assert fwd == pytest.approx(math.log(107 / 105), abs=1e-9)
 
     def test_short_spread_positive_when_spread_falls(self):
         prices = {
@@ -114,9 +112,9 @@ class TestComputeForwardReturns:
         )
         result = compute_forward_returns(signals_df, prices, n_bars=2)
         fwd = result["fwd_return_gross"][0]
-        # spread_0 = 5; spread_2 = 3
-        # fwd = -1 * (3 - 5) / 5 = 0.4
-        assert fwd == pytest.approx(0.4, abs=1e-9)
+        # log_spread_0 = log(105) - log(100); log_spread_2 = log(103) - log(100)
+        # fwd = -1 * (log(103) - log(105)) = log(105/103)
+        assert fwd == pytest.approx(math.log(105 / 103), abs=1e-9)
 
     def test_zero_signal_returns_null(self):
         signals_df = pl.DataFrame(
@@ -125,7 +123,8 @@ class TestComputeForwardReturns:
         result = compute_forward_returns(signals_df, self.prices, n_bars=3)
         assert result["fwd_return_gross"][0] is None
 
-    def test_normalized_by_spread_at_t(self):
+    def test_log_spread_difference(self):
+        """Return is the log-spread difference (already in percentage space)."""
         prices = {
             "A": _make_prices([110.0, 111.0, 112.0, 115.0]),
             "B": _make_prices([100.0] * 4),
@@ -135,8 +134,10 @@ class TestComputeForwardReturns:
         )
         result = compute_forward_returns(signals_df, prices, n_bars=2)
         fwd = result["fwd_return_gross"][0]
-        # spread_0 = 10; spread_2 = 12; fwd = (12 - 10) / 10 = 0.2
-        assert fwd == pytest.approx(0.2, abs=1e-9)
+        # log_spread_0 = log(110) - log(100) = log(1.1)
+        # log_spread_2 = log(112) - log(100) = log(1.12)
+        # fwd = log(1.12) - log(1.1) = log(112/110)
+        assert fwd == pytest.approx(math.log(112 / 110), abs=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +264,7 @@ class TestEvaluateAll:
         )
         expected_cols = {
             "date", "n_bars",
-            "ic_gross_weighted", "ic_net_weighted",
+            "ic_gross_weighted", "mean_net_return",
             "hit_rate_binary", "n_observations",
         }
         assert expected_cols.issubset(set(result.columns))
@@ -287,7 +288,7 @@ class TestEvaluateAll:
         # Net IC can differ from gross, but gross return > net return for positive trades
         # We just check both are finite floats
         assert isinstance(row["ic_gross_weighted"], float)
-        assert isinstance(row["ic_net_weighted"], float)
+        assert isinstance(row["mean_net_return"], float)
 
     def test_empty_signals_df_returns_empty(self):
         empty_signals = pl.DataFrame(

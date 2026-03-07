@@ -714,10 +714,11 @@ class TestExecLagIntegration:
         intraday = _make_intraday_df()
         trading_days = [dt.date(2023, 1, 3)]
 
-        call_count = {"n": 0}
+        onemin_calls = {"n": 0}
 
         def load_side_effect(ticker, timeframe, **kwargs):
-            call_count["n"] += 1
+            if timeframe == "1min":
+                onemin_calls["n"] += 1
             return intraday
 
         patches = [
@@ -733,12 +734,8 @@ class TestExecLagIntegration:
                 execution_lag_minutes=None,
                 **RECOMMENDED_PARAMS,
             )
-        # Should only load 15-min data (2 tickers), not 1-min data
-        assert all(
-            True for _ in range(call_count["n"])
-        ), "load_processed call count recorded"
-        # No 1-min call means the call count is for 2 tickers (A and B) at 15-min only
-        assert call_count["n"] == 2
+        # execution_lag_minutes=None must not trigger any 1-min data loads
+        assert onemin_calls["n"] == 0, f"Expected 0 1-min loads, got {onemin_calls['n']}"
 
     def test_lag0_open_uses_1min_price(self):
         """With lag=0 and field='open', entry price should equal the 1-min open."""

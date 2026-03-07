@@ -117,10 +117,23 @@ def _eval_combo(args: tuple) -> dict | None:
         pl.col("n_observations").sum(),
     ]).to_dicts()[0]
 
+    mean_net = agg["mean_net_return"]
+    # breakeven_bps: cost per leg at which net return = 0.
+    # mean_net_return = mean_gross_return - 4 * cost_bps / 10_000
+    # => breakeven_bps = cost_bps + mean_net_return * 2_500
+    if mean_net is not None:
+        mean_gross = mean_net + 4.0 * cost_bps / 10_000.0
+        breakeven = cost_bps + mean_net * 2_500.0
+    else:
+        mean_gross = None
+        breakeven = None
+
     return {
         **params,
-        "ic_gross":        agg["ic_gross_weighted"],
-        "mean_net_return": agg["mean_net_return"],
-        "hit_rate":        agg["hit_rate_binary"],
-        "n_obs":           agg["n_observations"],
+        "ic_gross":         agg["ic_gross_weighted"],
+        "mean_gross_return": mean_gross,
+        "mean_net_return":  mean_net,
+        "breakeven_bps":    breakeven,
+        "hit_rate":         agg["hit_rate_binary"],
+        "n_obs":            agg["n_observations"],
     }
