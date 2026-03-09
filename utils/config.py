@@ -61,9 +61,9 @@ class ApiConfig:
 @dataclass
 class CointegrationConfig:
     p_value_threshold: float = 0.05
-    min_half_life: int = 5  # trading days
-    max_half_life: int = 120  # trading days
-    rolling_window_days: int = 84  # ~60 trading days in calendar days
+    min_half_life: int = 4  # bars
+    max_half_life: int = 24  # bars (12 has worked best)
+    rolling_window_days: int = 42  # ~60 trading days in calendar days
     rolling_step_days: int = 1  # daily recomputation
 
 
@@ -80,7 +80,7 @@ class SignalConfig:
 class PortfolioConfig:
     capital: float = 100_000.0
     max_pairs: int = 10
-    transaction_cost_bps: float = 20.0  # per leg
+    transaction_cost_bps: float = 5.0  # per leg
 
 
 @dataclass
@@ -115,7 +115,8 @@ CONFIG = Config()
 CONFIG.api.api_key = os.environ.get("EODHD_KEY", CONFIG.api.api_key)
 
 CONFIG.universe.sector_mapping = {
-    # ── Technology (10) ─────────────────────────────────────
+    # ── Technology (38: former Technology + Semiconductors) ──
+    # Software / IT services
     "AAPL": "Technology",
     "MSFT": "Technology",
     "GOOGL": "Technology",
@@ -126,17 +127,36 @@ CONFIG.universe.sector_mapping = {
     "CRM": "Technology",
     "ADBE": "Technology",
     "ORCL": "Technology",
-    # ── Semiconductors (9) ──────────────────────────────────
-    "AVGO": "Semiconductors",
-    "TXN": "Semiconductors",
-    "QCOM": "Semiconductors",
-    "MU": "Semiconductors",
-    "LRCX": "Semiconductors",
-    "AMAT": "Semiconductors",
-    "KLAC": "Semiconductors",
-    "MCHP": "Semiconductors",
-    "ON": "Semiconductors",
-    # ── Financials (10) ─────────────────────────────────────
+    "IBM": "Technology",
+    "CSCO": "Technology",
+    "NOW": "Technology",
+    "INTU": "Technology",
+    "PYPL": "Technology",  # spun off from eBay Jul-2015; early weeks may be partial
+    "SNPS": "Technology",
+    "CDNS": "Technology",
+    "ACN": "Technology",
+    "FISV": "Technology",
+    "FIS": "Technology",
+    # Semiconductors (merged from own sector — same GICS IT parent)
+    "AVGO": "Technology",
+    "TXN": "Technology",
+    "QCOM": "Technology",
+    "MU": "Technology",
+    "LRCX": "Technology",
+    "AMAT": "Technology",
+    "KLAC": "Technology",
+    "MCHP": "Technology",
+    "ON": "Technology",
+    "ADI": "Technology",
+    "MRVL": "Technology",
+    "SWKS": "Technology",
+    "NXPI": "Technology",
+    "QRVO": "Technology",  # formed Jan-2015 (RF Micro + TriQuint merger); early 2015 partial
+    "MPWR": "Technology",
+    "ASML": "Technology",
+    "ENTG": "Technology",
+    "TER": "Technology",
+    # ── Financials (20) ─────────────────────────────────────
     "JPM": "Financials",
     "BAC": "Financials",
     "GS": "Financials",
@@ -147,7 +167,17 @@ CONFIG.universe.sector_mapping = {
     "SCHW": "Financials",
     "USB": "Financials",
     "PNC": "Financials",
-    # ── Healthcare / Pharma (10) ────────────────────────────
+    "AXP": "Financials",
+    "COF": "Financials",
+    "MET": "Financials",
+    "PRU": "Financials",
+    "TFC": "Financials",  # BB&T+SunTrust merged Dec-2019; pre-2020 data is BB&T history
+    "FITB": "Financials",
+    "RF": "Financials",
+    "CFG": "Financials",
+    "MTB": "Financials",
+    "KEY": "Financials",
+    # ── Healthcare (20) ─────────────────────────────────────
     "JNJ": "Healthcare",
     "PFE": "Healthcare",
     "UNH": "Healthcare",
@@ -158,28 +188,58 @@ CONFIG.universe.sector_mapping = {
     "ABBV": "Healthcare",
     "BMY": "Healthcare",
     "AMGN": "Healthcare",
-    # ── Consumer Discretionary (10) ─────────────────────────
-    "AMZN": "Consumer Discretionary",
-    "TSLA": "Consumer Discretionary",
-    "HD": "Consumer Discretionary",
-    "MCD": "Consumer Discretionary",
-    "NKE": "Consumer Discretionary",
-    "SBUX": "Consumer Discretionary",
-    "LOW": "Consumer Discretionary",
-    "TJX": "Consumer Discretionary",
-    "BKNG": "Consumer Discretionary",
-    "CMG": "Consumer Discretionary",
-    # ── Consumer Staples (9) ────────────────────────────────
-    "WMT": "Consumer Staples",
-    "PG": "Consumer Staples",
-    "COST": "Consumer Staples",
-    "KO": "Consumer Staples",
-    "PEP": "Consumer Staples",
-    "PM": "Consumer Staples",
-    "CL": "Consumer Staples",
-    "MDLZ": "Consumer Staples",
-    "KHC": "Consumer Staples",
-    # ── Energy (9) ──────────────────────────────────────────
+    "CVS": "Healthcare",
+    "CI": "Healthcare",
+    "HUM": "Healthcare",
+    "MDT": "Healthcare",
+    "SYK": "Healthcare",
+    "BSX": "Healthcare",
+    "ISRG": "Healthcare",
+    "REGN": "Healthcare",
+    "VRTX": "Healthcare",
+    "BIIB": "Healthcare",
+    # ── Consumer (38: former Discretionary + Staples) ────────
+    # Discretionary
+    "AMZN": "Consumer",
+    "TSLA": "Consumer",
+    "HD": "Consumer",
+    "MCD": "Consumer",
+    "NKE": "Consumer",
+    "SBUX": "Consumer",
+    "LOW": "Consumer",
+    "TJX": "Consumer",
+    "BKNG": "Consumer",
+    "CMG": "Consumer",
+    "ROST": "Consumer",
+    "ORLY": "Consumer",
+    "AZO": "Consumer",
+    "DPZ": "Consumer",
+    "YUM": "Consumer",
+    "MAR": "Consumer",
+    "HLT": "Consumer",
+    "F": "Consumer",
+    "GM": "Consumer",
+    "CCL": "Consumer",
+    # Staples
+    "WMT": "Consumer",
+    "PG": "Consumer",
+    "COST": "Consumer",
+    "KO": "Consumer",
+    "PEP": "Consumer",
+    "PM": "Consumer",
+    "CL": "Consumer",
+    "MDLZ": "Consumer",
+    "KHC": "Consumer",
+    "EL": "Consumer",
+    "MO": "Consumer",
+    "GIS": "Consumer",
+    "HSY": "Consumer",
+    "SYY": "Consumer",
+    "CLX": "Consumer",
+    "KMB": "Consumer",
+    "CHD": "Consumer",
+    "STZ": "Consumer",
+    # ── Energy (18) ─────────────────────────────────────────
     "XOM": "Energy",
     "CVX": "Energy",
     "COP": "Energy",
@@ -189,7 +249,16 @@ CONFIG.universe.sector_mapping = {
     "PSX": "Energy",
     "VLO": "Energy",
     "OXY": "Energy",
-    # ── Industrials (10) ────────────────────────────────────
+    "HAL": "Energy",
+    "BKR": "Energy",  # Baker Hughes in current form since Jul-2017 (GE O&G merger)
+    "DVN": "Energy",
+    "FANG": "Energy",
+    "MRO": "Energy",
+    "WMB": "Energy",
+    "KMI": "Energy",
+    "APA": "Energy",
+    "OKE": "Energy",
+    # ── Industrials (20) ────────────────────────────────────
     "CAT": "Industrials",
     "DE": "Industrials",
     "UNP": "Industrials",
@@ -200,7 +269,17 @@ CONFIG.universe.sector_mapping = {
     "LMT": "Industrials",
     "GE": "Industrials",
     "MMM": "Industrials",
-    # ── Communication Services (9) ──────────────────────────
+    "NOC": "Industrials",
+    "GD": "Industrials",
+    "FDX": "Industrials",
+    "ETN": "Industrials",
+    "EMR": "Industrials",
+    "PH": "Industrials",
+    "ITW": "Industrials",
+    "AME": "Industrials",
+    "ROK": "Industrials",
+    "XYL": "Industrials",
+    # ── Communication Services (18) ─────────────────────────
     "GOOG": "Communication Services",
     "DIS": "Communication Services",
     "CMCSA": "Communication Services",
@@ -210,22 +289,46 @@ CONFIG.universe.sector_mapping = {
     "TMUS": "Communication Services",
     "CHTR": "Communication Services",
     "EA": "Communication Services",
-    # ── Utilities (7) ───────────────────────────────────────
-    "NEE": "Utilities",
-    "DUK": "Utilities",
-    "SO": "Utilities",
-    "D": "Utilities",
-    "AEP": "Utilities",
-    "SRE": "Utilities",
-    "EXC": "Utilities",
-    # ── REITs (7) ───────────────────────────────────────────
-    "PLD": "REITs",
-    "AMT": "REITs",
-    "CCI": "REITs",
-    "EQIX": "REITs",
-    "SPG": "REITs",
-    "PSA": "REITs",
-    "O": "REITs",
+    "PARA": "Communication Services",  # continuous listing: CBS Corp → VIAC → PARA
+    "LYV": "Communication Services",
+    "TTWO": "Communication Services",
+    "IPG": "Communication Services",
+    "OMC": "Communication Services",
+    "NWSA": "Communication Services",
+    "SIRI": "Communication Services",
+    "MTCH": "Communication Services",  # IPO Nov-2015; first weeks may be partial
+    "LBTYA": "Communication Services",
+    # ── Real Assets (28: former Utilities + REITs) ───────────
+    # Utilities
+    "NEE": "Real Assets",
+    "DUK": "Real Assets",
+    "SO": "Real Assets",
+    "D": "Real Assets",
+    "AEP": "Real Assets",
+    "SRE": "Real Assets",
+    "EXC": "Real Assets",
+    "PPL": "Real Assets",
+    "ED": "Real Assets",
+    "FE": "Real Assets",
+    "ES": "Real Assets",
+    "WEC": "Real Assets",
+    "XEL": "Real Assets",
+    "AWK": "Real Assets",
+    # REITs
+    "PLD": "Real Assets",
+    "AMT": "Real Assets",
+    "CCI": "Real Assets",
+    "EQIX": "Real Assets",
+    "SPG": "Real Assets",
+    "PSA": "Real Assets",
+    "O": "Real Assets",
+    "VTR": "Real Assets",
+    "WELL": "Real Assets",
+    "EXR": "Real Assets",
+    "AVB": "Real Assets",
+    "EQR": "Real Assets",
+    "DLR": "Real Assets",
+    "ARE": "Real Assets",
 }
 
 

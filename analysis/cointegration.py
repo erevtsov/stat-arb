@@ -79,9 +79,9 @@ def _fast_adfuller(y: np.ndarray) -> tuple[float, float]:
     """
     dy = np.diff(y)
     # Δy_t = c + φ*y_{t-1} + γ*Δy_{t-1} + ε   (t = 2..n)
-    y_lag  = y[1:-1]   # y_{t-1}
-    dy_lag = dy[:-1]   # Δy_{t-1}
-    y_reg  = dy[1:]    # Δy_t
+    y_lag = y[1:-1]  # y_{t-1}
+    dy_lag = dy[:-1]  # Δy_{t-1}
+    y_reg = dy[1:]  # Δy_t
 
     X = np.empty((len(y_reg), 3), dtype=np.float64)
     X[:, 0] = 1.0
@@ -188,10 +188,14 @@ def find_cointegrated_pairs(
     processed_dir = processed_dir or CONFIG.paths.processed_dir
     p_value_threshold = p_value_threshold or CONFIG.cointegration.p_value_threshold
     min_half_life = (
-        min_half_life if min_half_life is not None else CONFIG.cointegration.min_half_life
+        min_half_life
+        if min_half_life is not None
+        else CONFIG.cointegration.min_half_life
     )
     max_half_life = (
-        max_half_life if max_half_life is not None else CONFIG.cointegration.max_half_life
+        max_half_life
+        if max_half_life is not None
+        else CONFIG.cointegration.max_half_life
     )
 
     # Load close prices for all available tickers at specified timeframe
@@ -200,8 +204,9 @@ def find_cointegrated_pairs(
     if price_cache is not None:
         # Fast path: slice pre-loaded data, no Parquet I/O
         import datetime as _dt
+
         start_dt = _dt.date.fromisoformat(start_date) if start_date else None
-        end_dt   = _dt.date.fromisoformat(end_date)   if end_date   else None
+        end_dt = _dt.date.fromisoformat(end_date) if end_date else None
 
         cache_tickers = sorted(set(price_cache.keys()) & set(sector_mapping.keys()))
         if tickers is not None:
@@ -239,7 +244,9 @@ def find_cointegrated_pairs(
         for ticker in tickers:
             try:
                 # Pass date filters to load_processed() for efficient Parquet filtering
-                df = load_processed(ticker, timeframe, processed_dir, start_date, end_date)
+                df = load_processed(
+                    ticker, timeframe, processed_dir, start_date, end_date
+                )
 
                 # Skip if no data remains after filtering
                 if len(df) == 0:
@@ -338,7 +345,9 @@ def find_cointegrated_pairs(
 
     results: list[dict] = []
 
-    for ticker_a, ticker_b, sector in tqdm(pairs_to_test, desc="Testing cointegration"):
+    for ticker_a, ticker_b, sector in tqdm(
+        pairs_to_test, desc=f"Testing cointegration {end_date}"
+    ):
         ts_a, p_a = ticker_np[ticker_a]
         ts_b, p_b = ticker_np[ticker_b]
 

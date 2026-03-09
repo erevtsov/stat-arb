@@ -27,13 +27,13 @@ import polars as pl
 
 _worker_prices: dict[str, pl.DataFrame] = {}
 _worker_trading_days: list[dt.date] = []
-_worker_pairs_cache: dict[tuple[int, dt.date], pl.DataFrame | None] = {}
+_worker_pairs_cache: dict[tuple[int, int, int, dt.date], pl.DataFrame | None] = {}
 
 
 def _init_worker(
     prices_data: dict[str, pl.DataFrame],
     trading_days_data: list[dt.date],
-    pairs_cache_data: dict[tuple[int, dt.date], pl.DataFrame | None],
+    pairs_cache_data: dict[tuple[int, int, int, dt.date], pl.DataFrame | None],
 ) -> None:
     """Pool initializer — runs once per worker at startup."""
     global _worker_prices, _worker_trading_days, _worker_pairs_cache
@@ -57,11 +57,13 @@ def _eval_combo(args: tuple) -> dict | None:
     zscore_window_bars_val = params["zscore_window_days"] * bars_per_day_val
     max_holding_bars_val   = params["max_holding_minutes"] // minutes_per_bar_val
     formation_days         = params["formation_window_days"]
+    min_half_life          = params["min_half_life"]
+    max_half_life          = params["max_half_life"]
 
     all_day_signals: list[pl.DataFrame] = []
 
     for day_idx, day in enumerate(trading_days):
-        pairs_df = pairs_cache.get((formation_days, day))
+        pairs_df = pairs_cache.get((formation_days, min_half_life, max_half_life, day))
         if pairs_df is None:
             continue
 
@@ -116,6 +118,9 @@ def _eval_combo(args: tuple) -> dict | None:
         pl.col("hit_rate_binary").mean(),
         pl.col("n_observations").sum(),
     ]).to_dicts()[0]
+
+    if agg["n_observations"] == 0 or agg["mean_net_return"] is None:
+        return None
 
     mean_net = agg["mean_net_return"]
     # breakeven_bps: cost per leg at which net return = 0.
