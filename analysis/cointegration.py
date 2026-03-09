@@ -99,6 +99,70 @@ def _fast_adfuller(y: np.ndarray) -> tuple[float, float]:
     return adf_stat, p_value
 
 
+def _split_window_stats(
+    spread: np.ndarray,
+    p_threshold: float,
+) -> tuple[float, float, bool]:
+    """
+    Test ADF stationarity in both halves of the spread independently.
+
+    Motivated by Gregory & Hansen (1996): aggregate ADF can pass even when the
+    cointegrating relationship broke midway through the window.  Requiring both
+    halves to pass is a necessary (not sufficient) stability condition.
+
+    Args:
+        spread:      Spread time series (log_A - beta * log_B).
+        p_threshold: Max p-value for each half to be considered stationary.
+
+    Returns:
+        (p_first_half, p_second_half, both_consistent)
+        Returns (nan, nan, False) when either half has fewer than 10 observations.
+    """
+    mid = len(spread) // 2
+    if mid < 10:
+        return float("nan"), float("nan"), False
+    try:
+        _, p_first = _fast_adfuller(spread[:mid])
+        _, p_second = _fast_adfuller(spread[mid:])
+    except Exception:
+        return float("nan"), float("nan"), False
+    consistent = bool((p_first <= p_threshold) and (p_second <= p_threshold))
+    return float(p_first), float(p_second), consistent
+
+
+def _hedge_ratio_cv(log_a: np.ndarray, log_b: np.ndarray) -> float:
+    """
+    Estimate hedge ratio stability as the coefficient of variation across thirds.
+
+    Splits the log-price series into three equal thirds and estimates the OLS
+    hedge ratio (beta) on each.  CV = std / |mean| across the three estimates.
+
+    Low CV (< ~0.15) indicates a stable cointegrating relationship.
+    High CV suggests the hedge ratio is drifting — the pair may not be suitable
+    for a fixed-beta trading strategy.
+
+    Returns:
+        CV in [0, inf), or nan if fewer than 10 observations per third or mean ≈ 0.
+    """
+    n = len(log_a)
+    third = n // 3
+    if third < 10:
+        return float("nan")
+    betas = []
+    for i in range(3):
+        start = i * third
+        end = (i + 1) * third if i < 2 else n
+        try:
+            b = _compute_hedge_ratio(log_a[start:end], log_b[start:end])
+            betas.append(b)
+        except Exception:
+            return float("nan")
+    mean_b = float(np.mean(betas))
+    if abs(mean_b) < 1e-10:
+        return float("nan")
+    return float(np.std(betas, ddof=0) / abs(mean_b))
+
+
 def test_cointegration(
     prices_a: np.ndarray,
     prices_b: np.ndarray,
@@ -144,6 +208,8 @@ def find_cointegrated_pairs(
     min_half_life: float | None = None,
     max_half_life: float | None = None,
     price_cache: dict | None = None,
+    split_window_p_threshold: float | None = None,
+    require_split_window: bool = False,
 ) -> pl.DataFrame:
     """
     Find all cointegrated pairs within each sector.
@@ -163,15 +229,24 @@ def find_cointegrated_pairs(
         p_value_threshold:  Max p-value to include pair. Defaults to config value.
         min_half_life:      Min half-life filter (in bars). Defaults to config value.
         max_half_life:      Max half-life filter (in bars). Defaults to config value.
-        price_cache:        Optional pre-loaded price data: dict mapping ticker →
-                            DataFrame with [timestamp, close] columns covering at
-                            least [start_date, end_date].  When supplied, skips
-                            all Parquet I/O for formation-window data.
+        price_cache:             Optional pre-loaded price data: dict mapping ticker →
+                                 DataFrame with [timestamp, close] columns covering at
+                                 least [start_date, end_date].  When supplied, skips
+                                 all Parquet I/O for formation-window data.
+        split_window_p_threshold: ADF p-value threshold applied to each half of the
+                                 formation window independently.  Defaults to
+                                 p_value_threshold when None.  Used to populate
+                                 adf_p_first_half, adf_p_second_half, split_consistent.
+        require_split_window:    If True, only retain pairs where split_consistent=True
+                                 (i.e. both halves pass the split_window_p_threshold).
+                                 Default False — stability columns are always computed
+                                 and returned but do not filter by default.
 
     Returns:
         Polars DataFrame with columns:
         [ticker_a, ticker_b, hedge_ratio, adf_stat, p_value, half_life, sector,
-         timeframe, formation_start, formation_end, n_observations]
+         timeframe, formation_start, formation_end, n_observations,
+         adf_p_first_half, adf_p_second_half, split_consistent, hedge_ratio_cv]
         sorted by p_value ascending.
 
     Examples:
@@ -272,6 +347,10 @@ def find_cointegrated_pairs(
                 "formation_start": pl.Utf8,
                 "formation_end": pl.Utf8,
                 "n_observations": pl.Int64,
+                "adf_p_first_half": pl.Float64,
+                "adf_p_second_half": pl.Float64,
+                "split_consistent": pl.Boolean,
+                "hedge_ratio_cv": pl.Float64,
             }
         )
 
@@ -299,6 +378,10 @@ def find_cointegrated_pairs(
                 "formation_start": pl.Utf8,
                 "formation_end": pl.Utf8,
                 "n_observations": pl.Int64,
+                "adf_p_first_half": pl.Float64,
+                "adf_p_second_half": pl.Float64,
+                "split_consistent": pl.Boolean,
+                "hedge_ratio_cv": pl.Float64,
             }
         )
 
@@ -343,6 +426,9 @@ def find_cointegrated_pairs(
         prices = df[ticker].to_numpy().astype(np.float64)
         ticker_np[ticker] = (ts, prices)
 
+    # Resolve split-window threshold (defaults to main p_value_threshold)
+    _split_p = split_window_p_threshold if split_window_p_threshold is not None else p_value_threshold
+
     results: list[dict] = []
 
     for ticker_a, ticker_b, sector in tqdm(
@@ -372,11 +458,24 @@ def find_cointegrated_pairs(
         if result["half_life"] < min_half_life or result["half_life"] > max_half_life:
             continue
 
+        # Stability metrics — computed for every pair that passes the main filter
+        hedge_ratio = result["hedge_ratio"]
+        log_a = np.log(prices_a)
+        log_b = np.log(prices_b)
+        spread = log_a - hedge_ratio * log_b
+
+        p_first, p_second, split_ok = _split_window_stats(spread, _split_p)
+        hr_cv = _hedge_ratio_cv(log_a, log_b)
+
+        # Optional hard filter on split-window consistency
+        if require_split_window and not split_ok:
+            continue
+
         results.append(
             {
                 "ticker_a": ticker_a,
                 "ticker_b": ticker_b,
-                "hedge_ratio": result["hedge_ratio"],
+                "hedge_ratio": hedge_ratio,
                 "adf_stat": result["adf_stat"],
                 "p_value": result["p_value"],
                 "half_life": result["half_life"],
@@ -385,6 +484,10 @@ def find_cointegrated_pairs(
                 "formation_start": start_date,
                 "formation_end": end_date,
                 "n_observations": n_obs,
+                "adf_p_first_half": p_first,
+                "adf_p_second_half": p_second,
+                "split_consistent": split_ok,
+                "hedge_ratio_cv": hr_cv,
             }
         )
 
@@ -403,6 +506,10 @@ def find_cointegrated_pairs(
                 "formation_start": pl.Utf8,
                 "formation_end": pl.Utf8,
                 "n_observations": pl.Int64,
+                "adf_p_first_half": pl.Float64,
+                "adf_p_second_half": pl.Float64,
+                "split_consistent": pl.Boolean,
+                "hedge_ratio_cv": pl.Float64,
             }
         )
 

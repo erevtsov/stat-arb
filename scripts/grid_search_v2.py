@@ -62,11 +62,17 @@ SIGNAL_GRID: dict[str, list] = {
 }
 
 # Phase 2 formation grid
+# FORMATION_GRID: dict[str, list] = {
+#     "rolling_window_days": [21, 42, 84],
+#     "min_half_life": [4],
+#     "max_half_life": [12, 24, 48],
+#     "p_value_threshold": [0.01, 0.05],
+# }
 FORMATION_GRID: dict[str, list] = {
-    "rolling_window_days": [21, 42, 84],
+    "rolling_window_days": [42],
     "min_half_life": [4],
-    "max_half_life": [12, 24, 48],
-    "p_value_threshold": [0.01, 0.05],
+    "max_half_life": [12],
+    "p_value_threshold": [0.05],
 }
 
 # Phase 1 defaults (best-guess starting point)
@@ -178,24 +184,41 @@ def _eval_combo(combo: dict) -> list[dict] | None:
 
     signals_df = pl.concat(all_signals)
 
+    # Only evaluate at horizons the strategy can actually achieve (≤ max_holding_bars).
+    # Longer horizons would measure counterfactual returns the state machine never captures.
+    all_horizons = holding_horizons_bars(_timeframe)
+    valid_horizons = [h for h in all_horizons if h <= max_holding_bars_val]
+    if not valid_horizons:
+        valid_horizons = [min(all_horizons)]  # always evaluate at the shortest horizon
+
     # evaluate_all uses full_prices for forward-return lookups (includes lookahead bars)
     eval_df = evaluate_all(
         signals_df=signals_df,
         prices=_full_prices,
-        holding_bars_list=_holding_bars,
+        holding_bars_list=valid_horizons,
         cost_bps=_cost_bps,
     )
 
     if len(eval_df) == 0:
         return None
 
-    # Aggregate daily metrics across all eval dates per holding horizon
+    # Aggregate daily metrics across all eval dates per holding horizon.
+    # weighted_mean_ic_gross weights each day's IC by sqrt(n_obs) to de-weight
+    # low-observation days whose IC estimates are unreliable.
     agg = (
         eval_df.group_by("n_bars")
         .agg(
             [
                 pl.col("ic_gross_weighted").mean().alias("mean_ic_gross"),
                 pl.col("ic_gross_weighted").std().alias("std_ic_gross"),
+                (
+                    (
+                        pl.col("ic_gross_weighted")
+                        * pl.col("n_observations").cast(pl.Float64).sqrt()
+                    ).sum()
+                    / pl.col("n_observations").cast(pl.Float64).sqrt().sum()
+                ).alias("weighted_mean_ic_gross"),
+                pl.col("pooled_ic_gross").first().alias("pooled_ic_gross"),
                 pl.col("mean_net_return").mean().alias("mean_net_return"),
                 pl.col("hit_rate_binary").mean().alias("mean_hit_rate"),
                 pl.col("n_observations").sum().alias("total_n_obs"),
@@ -228,6 +251,8 @@ def _eval_combo(combo: dict) -> list[dict] | None:
                 **combo,
                 "n_bars": row["n_bars"],
                 "mean_ic_gross": row["mean_ic_gross"],
+                "weighted_mean_ic_gross": row["weighted_mean_ic_gross"],
+                "pooled_ic_gross": row["pooled_ic_gross"],
                 "std_ic_gross": row["std_ic_gross"],
                 "ic_t_stat": row["ic_t_stat"],
                 "mean_gross_return": mean_gross,
@@ -338,7 +363,7 @@ def main() -> None:
         "--workers",
         type=int,
         default=None,
-        help="Number of parallel workers (default: cpu_count - 2)",
+        help="Number of parallel workers (default: cpu_count - 4)",
     )
     parser.add_argument(
         "--output",
@@ -429,7 +454,7 @@ def main() -> None:
         )
 
         ctx = get_context("spawn")
-        n_workers = args.workers or max(1, (ctx.cpu_count() or 2) - 2)
+        n_workers = args.workers or max(1, (ctx.cpu_count() or 2) - 4)
         print(
             f"  Sweeping {len(signal_combos)} signal combos with {n_workers} workers..."
         )

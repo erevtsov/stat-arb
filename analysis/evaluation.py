@@ -211,6 +211,11 @@ def evaluate_all(
       4. Compute mean net return across active signals.
       5. Compute binary signal hit rate.
 
+    Also computes a pooled IC per horizon: all (signal_weighted, fwd_return_gross)
+    pairs across all dates are pooled into one dataset and a single Spearman
+    correlation is computed. This is more robust than mean-of-daily-ICs when
+    some days have few active signals.
+
     Args:
         signals_df:        Full signals DataFrame (all pairs, all timestamps).
                            Must have columns: date, timestamp, ticker_a, ticker_b,
@@ -224,16 +229,24 @@ def evaluate_all(
     Returns:
         Polars DataFrame with schema:
         [date: Utf8, n_bars: Int64, ic_gross_weighted: Float64,
-         mean_net_return: Float64, hit_rate_binary: Float64,
-         n_observations: Int64]
+         pooled_ic_gross: Float64, mean_net_return: Float64,
+         hit_rate_binary: Float64, n_observations: Int64]
+        pooled_ic_gross is the same value for every row sharing the same n_bars
+        (computed once across all dates for that horizon).
     """
     dates = signals_df["date"].unique().sort().to_list()
     result_rows: list[dict] = []
 
-    for date in dates:
-        day_signals = signals_df.filter(pl.col("date") == date)
+    for n_bars in holding_bars_list:
+        # Accumulate pooled (signal, return) arrays across all dates for this horizon
+        pooled_signals: list[float] = []
+        pooled_returns: list[float] = []
 
-        for n_bars in holding_bars_list:
+        horizon_rows: list[dict] = []
+
+        for date in dates:
+            day_signals = signals_df.filter(pl.col("date") == date)
+
             with_gross = compute_forward_returns(day_signals, prices, n_bars)
             with_net = compute_net_forward_returns(with_gross, cost_bps=cost_bps)
 
@@ -250,16 +263,35 @@ def evaluate_all(
                 with_net["signal_binary"], with_net["fwd_return_gross"]
             )
 
-            result_rows.append(
+            # Accumulate non-null pairs for pooled IC
+            if n_obs > 0:
+                active_nn = active.filter(pl.col("fwd_return_gross").is_not_null())
+                pooled_signals.extend(active_nn["signal_weighted"].to_list())
+                pooled_returns.extend(active_nn["fwd_return_gross"].to_list())
+
+            horizon_rows.append(
                 {
                     "date": date,
                     "n_bars": n_bars,
                     "ic_gross_weighted": ic_gross,
+                    "pooled_ic_gross": 0.0,  # placeholder; filled below
                     "mean_net_return": mean_net,
                     "hit_rate_binary": hit,
                     "n_observations": n_obs,
                 }
             )
+
+        # Compute pooled IC once for this horizon across all dates
+        if len(pooled_signals) >= 2:
+            pooled_ic, _ = spearmanr(pooled_signals, pooled_returns)
+            pooled_ic_val = float(pooled_ic)
+        else:
+            pooled_ic_val = 0.0
+
+        for row in horizon_rows:
+            row["pooled_ic_gross"] = pooled_ic_val
+
+        result_rows.extend(horizon_rows)
 
     if not result_rows:
         return pl.DataFrame(
@@ -267,6 +299,7 @@ def evaluate_all(
                 "date": pl.Utf8,
                 "n_bars": pl.Int64,
                 "ic_gross_weighted": pl.Float64,
+                "pooled_ic_gross": pl.Float64,
                 "mean_net_return": pl.Float64,
                 "hit_rate_binary": pl.Float64,
                 "n_observations": pl.Int64,
