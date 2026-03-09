@@ -59,6 +59,7 @@ SIGNAL_GRID: dict[str, list] = {
     "z_exit": [1.5, 2, 2.5],
     "z_stop": [4.5],
     "max_holding_minutes": [120, 240, 390],
+    "fixed_exit_norm": [True, False],
 }
 
 # Phase 2 formation grid
@@ -128,6 +129,7 @@ def _eval_combo(combo: dict) -> list[dict] | None:
     z_exit: float = combo["z_exit"]
     z_stop: float | None = combo["z_stop"]
     max_holding_minutes: int = combo["max_holding_minutes"]
+    fixed_exit_norm: bool = combo.get("fixed_exit_norm", False)
 
     bars_per_day = BARS_PER_DAY[_timeframe]
     minutes_per_bar = MINUTES_PER_BAR[_timeframe]
@@ -174,6 +176,7 @@ def _eval_combo(combo: dict) -> list[dict] | None:
             z_exit=z_exit,
             z_stop=z_stop,
             max_holding_bars=max_holding_bars_val,
+            fixed_exit_norm=fixed_exit_norm,
         )
 
         if len(day_signals) > 0:

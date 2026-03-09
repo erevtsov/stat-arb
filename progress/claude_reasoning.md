@@ -2,6 +2,19 @@
 
 ---
 
+## 2026-03-09 — Fix rolling volatility expansion in exit logic
+
+**Problem diagnosed in `neg_zexit_pnl.ipynb`:** 36.6% of z-exit trades are unprofitable, contributing -130.3% of total z-exit P&L. Root cause: when rolling sigma expands between entry and exit, the z-score exit threshold fires even though the raw spread hasn't actually reverted. For z_entry=3.5, z_exit=2.5, a sigma_exit/sigma_entry ratio >1.40 causes a loss.
+
+**Fix:** Added `fixed_exit_norm` flag. When enabled, the mean-reversion exit z-score is computed as `(spread[t] - mu_entry) / sigma_entry` using rolling stats snapshotted at entry time, rather than the current rolling stats. Stop-loss and time-stop still use rolling z-score.
+
+**Changes:**
+- `analysis/signals.py`: Added `compute_rolling_stats(spread, window)` helper; refactored `compute_zscore` to use it. Modified `generate_signals` to accept `spread`, `rolling_mean`, `rolling_std`, and `fixed_exit_norm` params — on entry snapshots mu/sigma, on exit computes fixed-norm z when flag is set. Updated `generate_pair_signals_for_day` to compute rolling stats explicitly and pass them through.
+- `utils/config.py`: Added `fixed_exit_norm: bool = False` to `SignalConfig` with explanatory comment.
+- `scripts/grid_search_v2.py`: Added `"fixed_exit_norm": [True, False]` to `SIGNAL_GRID`; wired the param through `_eval_combo` → `generate_pair_signals_for_day`.
+
+---
+
 ## 2026-03-08 — Portfolio parquet save with params in filename (strategy.ipynb)
 
 Added a new cell after the existing `save_results` call in `notebooks/strategy.ipynb`.
@@ -591,6 +604,141 @@ Two tests:
 
 **Recommended next config:** z_entry=3.5, z_exit=1.0, z_stop=5.0, max_hold=240, formation=63d, max_hl=24, zscore=2d, max_pairs=20
 
+
+## 2026-03-09 — Split-window ADF + formation parameter search
+
+**Files modified/created:**
+- `analysis/cointegration.py` — added `_split_window_stats`, `_hedge_ratio_cv`, extended `find_cointegrated_pairs`
+- `scripts/formation_search.py` — Stage A quality sweep (54 combos, no signal backtest)
+- `notebooks/formation_search.ipynb` — results analysis notebook
+
+### `analysis/cointegration.py` changes
+
+**`_split_window_stats(spread, p_threshold) -> (float, float, bool)`**
+- Splits spread into two halves, runs `_fast_adfuller` on each independently
+- Guard: `mid < 10` returns NaN/False rather than computing ADF on too-short windows
+- Motivation (Gregory-Hansen): aggregate ADF can pass even when cointegrating relationship breaks at the midpoint; requiring both halves to pass independently detects structural breaks within the formation window
+- Spread recomputed inline in the `find_cointegrated_pairs` loop (`log_a - hedge_ratio * log_b`) rather than refactoring `test_cointegration` — avoids changing an existing interface and is cheap (one numpy subtraction)
+
+**`_hedge_ratio_cv(log_a, log_b) -> float`**
+- Estimates β on each third of the formation window (3 estimates instead of 2) — gives a more robust CV with 3 points than just comparing two halves
+- Guard: `third < 10` (minimum 30 obs total for a valid CV estimate)
+- CV = `std(betas, ddof=0) / |mean(betas)|` — measures percentage drift in the cointegrating vector
+- Returns NaN if mean ≈ 0 (would produce division instability)
+
+**`find_cointegrated_pairs` signature extension**
+- New params: `split_window_p_threshold` (defaults to `p_value_threshold` if None), `require_split_window` (hard-filter on split_consistent when True)
+- All 3 empty-DataFrame schemas updated with 4 new columns: `adf_p_first_half`, `adf_p_second_half`, `split_consistent`, `hedge_ratio_cv`
+- `require_split_window=False` by default — new metrics are always computed but don't filter by default, preserving existing behavior
+
+### `scripts/formation_search.py` design
+
+**Two-stage rationale:** Formation param search (ADF on ~2,660 pairs × 54 combos × N eval days) is too slow to combine with signal backtest. Stage A evaluates pair quality only, Stage B runs signal sweep on the ~10–20% of combos that survive quality thresholds.
+
+**Formation grid:** 3×3×3×2 = 54 combos. `rolling_window_days ∈ {21, 42, 84}`, `min_half_life ∈ {2, 4, 8}`, `max_half_life ∈ {12, 24, 48}`, `p_value_threshold ∈ {0.01, 0.05}`.
+
+**Quality thresholds:**
+- `mean_n_pairs ≥ 5`: minimum portfolio diversification — below 5 pairs/day, the strategy has single-pair concentration risk
+- `pct_days_with_pairs ≥ 50%`: pairs must be available on most days — below 50%, formation parameters are too restrictive to run a live strategy
+- `split_consistency_rate ≥ 40%`: at least 40% of pairs pass both half-window ADF tests — a threshold below which the cointegration is mostly spurious. Intraday cointegration is inherently weaker than daily, so 40% (not 70%+) is appropriate
+
+**Composite score:** `split_consistency_rate × log(mean_n_pairs) × mean_n_sectors`
+- Multiplicative: all three factors must be non-trivially large to score well
+- `log(n_pairs)` rather than `n_pairs`: diminishing returns from extra pairs (10→20 pairs is more valuable than 100→110)
+- `mean_n_sectors`: diversification across sectors prevents correlated pair losses in sector-specific macro moves
+
+### `notebooks/formation_search.ipynb` workflow
+
+Final cell generates the Python dict for copy-paste into `FORMATION_GRID` in `grid_search_v2.py`, forming the bridge from Stage A → Stage B. The notebook is designed to be run after `formation_search.py` produces `results/formation_search.parquet`.
+
+---
+
+## 2026-03-09 — Portfolio comparison notebook
+
+**Created:** `notebooks/portfolio_comparison.ipynb`
+
+Compares all `results/portfolio/portfolio_tf15min*.parquet` files. Key design choices:
+- Parses param key-value pairs from filename with regex `([a-z]+)([\d.]+)` and date range suffix
+- Computes which params vary across files; legend shows only those (fixed params omitted)
+- Varying params in this run: `zx`, `zs`, `mp`, `mbr`, `cb`, `start`
+- Sections: full equity curves (each portfolio from its own start), normalized equity in common
+  window (max of all starts → min of all ends), cumulative gross/net P&L, drawdown, rolling 30d
+  Sharpe, summary stats table (total/ann return, Sharpe, max DD, Calmar, trades, win days),
+  bar chart of ann_ret/Sharpe/max_DD
+
+---
+
+## 2026-03-09 — Negative z_exit P&L analysis notebook
+
+**Created:** `notebooks/neg_zexit_pnl.ipynb`
+
+**Motivation:** Trades with `exit_reason=z_exit` should be profitable — the z-score crossed back
+through the exit threshold, indicating spread reversion. But a subset have `gross_pnl < 0`.
+Examples: AMAT/MCHP 2021-01-11 (dir=-1, pnl=-$83), AEP/WEC 2021-01-13, TXN/KLAC.
+
+**Root cause identified: rolling window normalization drift.**
+The z-score is `z_t = (S_t - mu_t) / sigma_t` where `mu` and `sigma` are computed over the
+last 130 bars (5 days at 15min). The z-score threshold crossing does NOT guarantee the raw
+log-spread reverted. Mathematical condition for a false z_exit (short spread, dir=-1):
+
+```
+At entry: S_entry = mu_entry + 3.5 * sigma_entry
+At exit:  S_exit  = mu_exit  + 2.5 * sigma_exit
+P&L < 0 when S_exit > S_entry, which occurs when sigma_exit / sigma_entry > 3.5/2.5 = 1.40
+```
+
+Any 40%+ intraday vol expansion between entry and exit causes z_exit to fire before actual
+reversion. Rolling mean drift compounds this.
+
+**Notebook sections:**
+1. Setup: loads `results/trades/trades_15min.parquet`, reconstructs `hedge_ratio = shares_b/shares_a`,
+   computes `log_spread_entry`, `log_spread_exit`, `log_spread_change`
+2. Cross-tab: P&L sign vs spread reversion flag (`direction × log_spread_change > 0`)
+3. Mathematical mechanism explanation with breakeven derivation (z_entry/z_exit = 1.40)
+4. `build_spread_zscore_series()`: loads 15-min history, computes 130-bar rolling z-score for
+   specific trades with entry/exit signal reconstruction
+5. AMAT/MCHP 2021-01-11 reconstruction: 3-panel plot (z-score, raw spread+bands, rolling std)
+6. `reconstruct_trade()`: generic wrapper for any trade; diagnoses std_ratio vs breakeven
+7. AEP/WEC 2021-01-13 reconstruction
+8. Systematic classification across all negative z_exit trades using execution prices
+9. P&L decomposition table (positive vs negative z_exit count, total, mean)
+10. Distribution plots (P&L, spread change, hold duration)
+11. Summary: 4 potential fixes (fixed normalization at entry, absolute spread target,
+    tighter max_holding, require min reversion gate) with trade-offs table
+
+---
+
+## 2026-03-09 — IC evaluation improvements: horizon gating, pooled IC, TARGET_N_BARS
+
+**Files modified:**
+- `analysis/evaluation.py` — added pooled IC to `evaluate_all()`
+- `scripts/grid_search_v2.py` — horizon gating in `_eval_combo()`, added weighted/pooled IC to aggregation
+- `notebooks/grid_search_v2.ipynb` — TARGET_N_BARS filtering, IC curve plot, pooled vs mean IC comparison
+
+### Three problems addressed
+
+**Problem 1: Phantom forward returns (highest priority)**
+`evaluate_all` was called with ALL four horizons [4, 8, 16, 26] bars for every combo regardless of
+`max_holding_minutes`. A combo with `max_hold=120min` (8 bars) was getting IC computed at 16 and 26
+bars — returns the state machine can never capture. Since spread mean-reverts slowly, IC at longer
+horizons looks better than at 4-8 bars, making slow-reverting pairs appear attractive.
+
+Fix: in `_eval_combo`, compute `valid_horizons = [h for h in all_horizons if h <= max_hold_bars]`
+and pass only those to `evaluate_all`. Fallback to minimum horizon if none fit.
+
+**Problem 2: Mean-of-daily-IC weights low-signal days equally**
+IC computed on 2 pairs is meaningless noise but contributed equal weight to `mean_ic_gross`.
+
+Fix A: `weighted_mean_ic_gross` — weight daily IC by `sqrt(n_obs)`.
+Fix B: `pooled_ic_gross` — pool all (signal, return) pairs across all dates per horizon, compute
+one Spearman correlation. Accumulated in `evaluate_all` via per-horizon lists; broadcast as constant
+to all rows sharing the same n_bars.
+
+**Problem 3: Notebook horizon filtering**
+All selection cells now use `TARGET_N_BARS = min(df['n_bars'].unique())`. Added `best_pooled` table
+and IC curve plot + pooled-vs-mean scatter.
+
+---
 
 ## 2026-03-08 — Correction: strategy.ipynb parameter overrides
 

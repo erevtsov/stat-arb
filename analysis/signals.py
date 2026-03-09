@@ -41,6 +41,25 @@ def compute_spread(
     return prices_a.log(math.e) - hedge_ratio * prices_b.log(math.e)
 
 
+def compute_rolling_stats(
+    spread: pl.Series,
+    window: int,
+) -> tuple[pl.Series, pl.Series]:
+    """
+    Compute rolling mean and standard deviation of the spread.
+
+    Args:
+        spread: Spread time series.
+        window: Rolling window in bars.
+
+    Returns:
+        Tuple of (rolling_mean, rolling_std) Polars Series.
+    """
+    rolling_mean = spread.rolling_mean(window_size=window)
+    rolling_std = spread.rolling_std(window_size=window)
+    return rolling_mean, rolling_std
+
+
 def compute_zscore(
     spread: pl.Series,
     window: int | None = None,
@@ -62,17 +81,20 @@ def compute_zscore(
         raise ValueError(
             "window is required. Use zscore_window_bars(timeframe) from utils.config."
         )
-    rolling_mean = spread.rolling_mean(window_size=window)
-    rolling_std = spread.rolling_std(window_size=window)
+    rolling_mean, rolling_std = compute_rolling_stats(spread, window)
     return (spread - rolling_mean) / rolling_std
 
 
 def generate_signals(
     zscore: pl.Series,
+    spread: pl.Series | None = None,
+    rolling_mean: pl.Series | None = None,
+    rolling_std: pl.Series | None = None,
     z_entry: float | None = None,
     z_exit: float | None = None,
     z_stop: float | None = None,
     max_holding_bars: int | None = None,
+    fixed_exit_norm: bool = False,
 ) -> pl.Series:
     """
     Generate position signals from a z-score series.
@@ -89,11 +111,18 @@ def generate_signals(
 
     Args:
         zscore:           Z-score series.
+        spread:           Raw log-spread series. Required when fixed_exit_norm=True.
+        rolling_mean:     Rolling mean series. Required when fixed_exit_norm=True.
+        rolling_std:      Rolling std series. Required when fixed_exit_norm=True.
         z_entry:          Entry threshold. Defaults to CONFIG value.
         z_exit:           Exit threshold. Defaults to CONFIG value.
         z_stop:           Stop-loss threshold. None = no stop-loss (rely on z_exit
                           and time stop only). Defaults to CONFIG value.
         max_holding_bars: Max bars before forced exit. None = no time stop.
+        fixed_exit_norm:  If True, the mean-reversion exit z-score is computed using
+                          the rolling mean/std snapshotted at entry rather than the
+                          current rolling values. This prevents vol expansion from
+                          triggering spurious exits when sigma grows after entry.
 
     Returns:
         Polars Series of signals: +1 (long spread), -1 (short spread), 0 (flat).
@@ -114,6 +143,13 @@ def generate_signals(
     _z_exit = z_exit
     _z_stop = z_stop
     _max_holding = max_holding_bars
+    _fixed = fixed_exit_norm and spread is not None and rolling_mean is not None and rolling_std is not None
+
+    spread_vals = spread.to_numpy() if _fixed else None
+    mean_vals = rolling_mean.to_numpy() if _fixed else None
+    std_vals = rolling_std.to_numpy() if _fixed else None
+    mu_entry = 0.0
+    sigma_entry = 1.0
 
     for i in range(n):
         z = zvals[i]
@@ -127,20 +163,31 @@ def generate_signals(
             # Check entry
             if z < -_z_entry:
                 position = 1  # long spread
+                if _fixed:
+                    mu_entry = mean_vals[i]
+                    sigma_entry = std_vals[i]
             elif z > _z_entry:
                 position = -1  # short spread
+                if _fixed:
+                    mu_entry = mean_vals[i]
+                    sigma_entry = std_vals[i]
         else:
             bars_held += 1
             # Check exit conditions
             exit_trade = False
 
-            # Mean reversion exit
-            if position == 1 and z >= -_z_exit:
+            # Mean reversion exit — use fixed entry-time normalization if requested
+            if _fixed and sigma_entry != 0.0:
+                z_exit_val = (spread_vals[i] - mu_entry) / sigma_entry
+            else:
+                z_exit_val = z
+
+            if position == 1 and z_exit_val >= -_z_exit:
                 exit_trade = True
-            elif position == -1 and z <= _z_exit:
+            elif position == -1 and z_exit_val <= _z_exit:
                 exit_trade = True
 
-            # Stop loss exit (skipped when z_stop is None)
+            # Stop loss exit uses rolling z-score (vol expansion into stop is a real signal)
             if not exit_trade and _z_stop is not None:
                 if z > _z_stop or z < -_z_stop:
                     exit_trade = True
@@ -205,6 +252,7 @@ def generate_pair_signals_for_day(
     z_exit: float | None = None,
     z_stop: float | None = None,
     max_holding_bars: int | None = None,
+    fixed_exit_norm: bool = False,
 ) -> pl.DataFrame:
     """
     Generate intraday signals for all cointegrated pairs on a single trading day.
@@ -229,6 +277,8 @@ def generate_pair_signals_for_day(
         z_stop:          Stop-loss z-score threshold (default: CONFIG.signal.z_stop).
         max_holding_bars: Max bars before forced exit (default:
                           CONFIG.signal.max_holding_minutes derived at call site).
+        fixed_exit_norm:  If True, use entry-time rolling mean/std for exit z-score
+                          to prevent vol expansion from triggering spurious exits.
 
     Returns:
         Polars DataFrame with schema:
@@ -281,13 +331,18 @@ def generate_pair_signals_for_day(
         timestamps = merged["timestamp"]
 
         spread = compute_spread(prices_a, prices_b, hedge_ratio)
-        zscore = compute_zscore(spread, window=zscore_window)
+        rolling_mean, rolling_std = compute_rolling_stats(spread, window=zscore_window)
+        zscore = (spread - rolling_mean) / rolling_std
         signal_bin = generate_signals(
             zscore,
+            spread=spread,
+            rolling_mean=rolling_mean,
+            rolling_std=rolling_std,
             z_entry=z_entry,
             z_exit=z_exit,
             z_stop=z_stop,
             max_holding_bars=max_holding_bars,
+            fixed_exit_norm=fixed_exit_norm,
         )
 
         n = len(timestamps)

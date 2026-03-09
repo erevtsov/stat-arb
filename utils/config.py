@@ -52,8 +52,8 @@ class ApiConfig:
     api_key: str = "your_key_here"  # override via EODHD_KEY env var at runtime
     exchange: str = "US"
     max_workers: int = 5
-    start_date: str = "2020-01-01"
-    end_date: str = "2025-12-31"
+    start_date: str = "2017-01-01"
+    end_date: str = "2026-02-28"
     intraday_chunk_days: int = 120
     request_delay: float = 0.2
 
@@ -74,6 +74,10 @@ class SignalConfig:
     z_exit: float = 0.0
     z_stop: float = 4.0
     max_holding_minutes: int = 120  # converted to bars at runtime
+    # If True, exit z-score is computed using the rolling mean/std snapshotted at entry
+    # rather than the current rolling mean/std. This prevents vol expansion from
+    # triggering spurious exits when sigma grows between entry and exit.
+    fixed_exit_norm: bool = True
 
 
 @dataclass
