@@ -60,31 +60,55 @@ class ApiConfig:
 
 @dataclass
 class CointegrationConfig:
-    p_value_threshold: float = 0.05
-    min_half_life: int = 4  # bars
-    max_half_life: int = 24  # bars (12 has worked best)
-    rolling_window_days: int = 42  # ~60 trading days in calendar days
-    rolling_step_days: int = 1  # daily recomputation
+    p_value_threshold: float = 0.05  # ADF test p-value cutoff for pair inclusion
+    min_half_life: int = 4  # minimum spread half-life in bars
+    max_half_life: int = 24  # maximum spread half-life in bars
+    rolling_window_days: int = (
+        42  # formation window in calendar days (~60 trading days)
+    )
+    rolling_step_days: int = 1  # daily recomputation cadence
+    require_split_window: bool = (
+        False  # if True, pair must cointegrate in both halves of
+    )
+    # the formation window independently (stricter filter)
 
 
 @dataclass
 class SignalConfig:
-    zscore_window_days: int = 5  # converted to bars at runtime
-    z_entry: float = 2.5
-    z_exit: float = 0.0
-    z_stop: float = 4.0
-    max_holding_minutes: int = 120  # converted to bars at runtime
-    # If True, exit z-score is computed using the rolling mean/std snapshotted at entry
-    # rather than the current rolling mean/std. This prevents vol expansion from
-    # triggering spurious exits when sigma grows between entry and exit.
-    fixed_exit_norm: bool = True
+    zscore_window_days: int = (
+        5  # rolling window for z-score, in trading days; converted to bars at runtime
+    )
+    z_entry: float = 2.5  # enter when |z| exceeds this threshold
+    z_exit: float = 0.0  # exit (mean reversion) when |z| falls below this
+    z_stop: float | None = 4.0  # stop-loss: exit when |z| exceeds this; None = disabled
+    max_holding_minutes: int = (
+        120  # max holding time before time-stop; converted to bars at runtime
+    )
+    fixed_exit_norm: bool = (
+        True  # if True, exit z-score uses entry-time rolling mean/std
+    )
+    # to prevent vol expansion from triggering spurious exits
 
 
 @dataclass
 class PortfolioConfig:
-    capital: float = 100_000.0
-    max_pairs: int = 10
-    transaction_cost_bps: float = 5.0  # per leg
+    capital: float = 100_000.0  # starting portfolio value in dollars
+    max_pairs: int = 10  # max simultaneous open pair positions
+    transaction_cost_bps: float = 5.0  # one-way cost per leg in basis points
+    # Backtest execution params
+    start_date: str = "2022-07-01"  # first trading day (YYYY-MM-DD)
+    end_date: str = "2024-12-31"  # last trading day (YYYY-MM-DD)
+    timeframe: str = "15min"  # bar frequency for signals
+    min_bars_remaining: int = 8  # min bars left in the day after entry bar;
+    # prevents late-day entries with no time to revert
+    execution_lag_minutes: int | None = (
+        None  # minutes into next bar at which the order fills;
+    )
+    # None = midpoint of next signal-timeframe bar
+    execution_price_field: str = (
+        "open"  # 1-min bar field used when execution_lag_minutes
+    )
+    # is set; one of "open", "high", "low", "close", "mid"
 
 
 @dataclass

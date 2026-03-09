@@ -2,6 +2,35 @@
 
 ---
 
+## 2026-03-09 — Config-driven run_backtest + require_split_window
+
+**Motivation:** `run_backtest` had an ever-growing explicit parameter list. Any new cointegration or signal tunable required a signature change. Solution: collapse all parameters into a single `Config` instance; `run_backtest` now takes only `config: Config | None = None`.
+
+**Changes:**
+
+- `utils/config.py`:
+  - `CointegrationConfig`: added `require_split_window: bool = False` — when True, a pair must cointegrate in both halves of the formation window independently. Added inline comments to all fields.
+  - `SignalConfig`: changed `z_stop: float = 4.0` → `z_stop: float | None = 4.0` (None disables stop-loss); added `fixed_exit_norm: bool = True` (default True — uses entry-time rolling stats for exit). Added inline comments to all fields.
+  - `PortfolioConfig`: added `start_date`, `end_date`, `timeframe`, `min_bars_remaining`, `execution_lag_minutes`, `execution_price_field` fields so all backtest execution params live in the config.
+
+- `strategy/backtester.py`:
+  - Replaced all individual explicit params with `config: Config | None = None`.
+  - Resolver block at function top reads all params from `cfg = config or CONFIG`.
+  - `find_cointegrated_pairs` now receives `p_value_threshold`, `min_half_life`, `max_half_life`, `require_split_window` from config.
+  - `generate_pair_signals_for_day` now receives `fixed_exit_norm` from config.
+  - Import updated to `from utils.config import BARS_PER_DAY, CONFIG, Config, MINUTES_PER_BAR, get_all_tickers`.
+
+- `tests/test_backtester.py`:
+  - Removed `RECOMMENDED_PARAMS` dict; added `_make_config` and `_recommended_config` helpers that return `Config` instances.
+  - All `run_backtest` call sites updated to use `config=`.
+  - Added `TestConfigParamEffects` class with 4 new tests: `test_no_config_uses_module_default`, `test_cost_bps_from_config_affects_net_pnl`, `test_max_pairs_from_config_limits_positions`, `test_zscore_window_days_from_config_runs_without_error`. All 40 tests pass.
+
+- `scripts/debug.py`: Replaced `run_backtest(start_date=..., end_date=..., cost_bps=1.5)` with a `Config()` object.
+
+- `notebooks/strategy.ipynb`: Replaced `CONFIG.signal.zscore_window_days = 5` + `BACKTEST_PARAMS` dict + `run_backtest(**BACKTEST_PARAMS)` pattern with a `cfg = Config()` setup cell. All downstream cells updated to reference `cfg.*` attributes instead of `BACKTEST_PARAMS[...]`.
+
+---
+
 ## 2026-03-09 — Fix rolling volatility expansion in exit logic
 
 **Problem diagnosed in `neg_zexit_pnl.ipynb`:** 36.6% of z-exit trades are unprofitable, contributing -130.3% of total z-exit P&L. Root cause: when rolling sigma expands between entry and exit, the z-score exit threshold fires even though the raw spread hasn't actually reverted. For z_entry=3.5, z_exit=2.5, a sigma_exit/sigma_entry ratio >1.40 causes a loss.

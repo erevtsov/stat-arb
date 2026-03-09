@@ -29,7 +29,7 @@ import polars as pl
 from analysis.cointegration import find_cointegrated_pairs
 from analysis.preprocessing import load_processed
 from analysis.signals import compute_pvalue_weights, generate_pair_signals_for_day
-from utils.config import CONFIG, MINUTES_PER_BAR, get_all_tickers, max_holding_bars, zscore_window_bars
+from utils.config import BARS_PER_DAY, CONFIG, Config, MINUTES_PER_BAR, get_all_tickers
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -187,79 +187,57 @@ def _get_exec_price(
 # ---------------------------------------------------------------------------
 
 
-def run_backtest(
-    start_date: str = "2022-07-01",
-    end_date: str = "2024-12-31",
-    timeframe: str = "15min",
-    rolling_window_days: int | None = None,
-    z_entry: float | None = None,
-    z_exit: float | None = None,
-    z_stop: float | None = None,
-    max_pairs: int | None = None,
-    capital: float | None = None,
-    cost_bps: float | None = None,
-    min_bars_remaining: int = 8,
-    max_holding_minutes: int = 120,
-    execution_lag_minutes: int | None = None,
-    execution_price_field: str = "open",
-) -> tuple[pl.DataFrame, pl.DataFrame]:
+def run_backtest(config: Config | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
     """
     Run the full intraday pairs-trading backtest.
 
-    Args:
-        start_date:             First trading day (YYYY-MM-DD).
-        end_date:               Last trading day (YYYY-MM-DD).
-        timeframe:              Bar frequency (e.g., "15min").
-        rolling_window_days:    Calendar days for the formation window.
-                                Defaults to CONFIG.cointegration.rolling_window_days.
-        z_entry:                Entry z-score threshold. Defaults to CONFIG.signal.z_entry.
-        z_exit:                 Exit z-score threshold. Defaults to CONFIG.signal.z_exit.
-        z_stop:                 Stop-loss threshold. None = no stop-loss (rely on
-                                z_exit and EOD close only). Defaults to CONFIG.signal.z_stop.
-        max_pairs:              Max simultaneous open positions.
-                                Defaults to CONFIG.portfolio.max_pairs.
-        capital:                Starting portfolio value.
-                                Defaults to CONFIG.portfolio.capital.
-        cost_bps:               One-way cost per leg in bps.
-                                Defaults to CONFIG.portfolio.transaction_cost_bps.
-        min_bars_remaining:     Minimum bars that must remain in the trading day
-                                after the entry execution bar.  Prevents late-day
-                                entries that have no time for mean reversion.
-                                Default 8 bars (2 hours at 15-min).
-        max_holding_minutes:    Maximum intraday holding time in minutes before the
-                                signal generator issues a time-stop exit.  All
-                                positions are also force-closed at EOD every day
-                                (intraday-only mandate).  Default 120 minutes.
-        execution_lag_minutes:  Minutes after the start of the next signal-timeframe
-                                bar at which the order fills.  Requires 1-min
-                                processed data on disk.  None (default) keeps the
-                                existing behaviour: midpoint of the next
-                                signal-timeframe bar.  0 = open of the first 1-min
-                                bar of the execution window; 5 = price 5 minutes in.
-        execution_price_field:  Which field of the 1-min bar to use when
-                                execution_lag_minutes is not None.  One of
-                                "open", "high", "low", "close", "mid"
-                                (mid = (high + low) / 2).  Default "open".
+    All parameters are read from a ``Config`` instance. Pass a custom ``Config``
+    to override any setting; omit it (or pass ``None``) to use the module-level
+    ``CONFIG`` singleton.
+
+    Key config sections:
+        config.portfolio   — start_date, end_date, timeframe, capital, max_pairs,
+                             transaction_cost_bps, min_bars_remaining,
+                             execution_lag_minutes, execution_price_field
+        config.cointegration — rolling_window_days, p_value_threshold,
+                               min_half_life, max_half_life, require_split_window
+        config.signal      — z_entry, z_exit, z_stop, max_holding_minutes,
+                             zscore_window_days, fixed_exit_norm
 
     Returns:
         (trades_df, daily_pnl_df) — see module docstring for schemas.
     """
-    # Resolve defaults
-    rolling_window_days = (
-        rolling_window_days or CONFIG.cointegration.rolling_window_days
-    )
-    z_entry = z_entry if z_entry is not None else CONFIG.signal.z_entry
-    z_exit = z_exit if z_exit is not None else CONFIG.signal.z_exit
-    # z_stop=None → no stop-loss (pass None through to signal generator)
-    max_pairs = max_pairs if max_pairs is not None else CONFIG.portfolio.max_pairs
-    capital = capital if capital is not None else CONFIG.portfolio.capital
-    cost_bps = (
-        cost_bps if cost_bps is not None else CONFIG.portfolio.transaction_cost_bps
-    )
+    cfg = config if config is not None else CONFIG
 
-    zscore_window = zscore_window_bars(timeframe)
+    # Portfolio / execution
+    start_date            = cfg.portfolio.start_date
+    end_date              = cfg.portfolio.end_date
+    timeframe             = cfg.portfolio.timeframe
+    min_bars_remaining    = cfg.portfolio.min_bars_remaining
+    execution_lag_minutes = cfg.portfolio.execution_lag_minutes
+    execution_price_field = cfg.portfolio.execution_price_field
+    max_pairs             = cfg.portfolio.max_pairs
+    capital               = cfg.portfolio.capital
+    cost_bps              = cfg.portfolio.transaction_cost_bps
+
+    # Cointegration
+    rolling_window_days  = cfg.cointegration.rolling_window_days
+    p_value_threshold    = cfg.cointegration.p_value_threshold
+    min_half_life        = cfg.cointegration.min_half_life
+    max_half_life        = cfg.cointegration.max_half_life
+    require_split_window = cfg.cointegration.require_split_window
+
+    # Signal
+    z_entry             = cfg.signal.z_entry
+    z_exit              = cfg.signal.z_exit
+    z_stop              = cfg.signal.z_stop
+    max_holding_minutes = cfg.signal.max_holding_minutes
+    zscore_window_days  = cfg.signal.zscore_window_days
+    fixed_exit_norm     = cfg.signal.fixed_exit_norm
+
+    zscore_window        = zscore_window_days * BARS_PER_DAY[timeframe]
     # Number of lookback trading days needed to warm up the z-score window
-    zscore_lookback_days = CONFIG.signal.zscore_window_days + 1
+    zscore_lookback_days = zscore_window_days + 1
     max_holding_bars_val = max_holding_minutes // MINUTES_PER_BAR[timeframe]
 
     trading_days = _get_nyse_trading_days(start_date, end_date)
@@ -296,6 +274,10 @@ def run_backtest(
                 end_date=str(formation_end),
                 timeframe=timeframe,
                 price_cache=_price_cache,
+                p_value_threshold=p_value_threshold,
+                min_half_life=min_half_life,
+                max_half_life=max_half_life,
+                require_split_window=require_split_window,
             )
         except Exception:
             pairs_df = None
@@ -359,6 +341,7 @@ def run_backtest(
                 z_exit=z_exit,
                 z_stop=z_stop,
                 max_holding_bars=max_holding_bars_val,
+                fixed_exit_norm=fixed_exit_norm,
             )
         except Exception:
             daily_pnl_rows.append(

@@ -12,7 +12,7 @@ from strategy.backtester import (
     _get_exec_price,
     run_backtest,
 )
-from utils.config import CONFIG
+from utils.config import CONFIG, Config
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -239,6 +239,34 @@ def _make_trade_signals_df(
     )
 
 
+def _make_config(start_date: str, end_date: str, **overrides) -> Config:
+    """Create a minimal Config for testing with the given date range."""
+    cfg = Config()
+    cfg.portfolio.start_date = start_date
+    cfg.portfolio.end_date = end_date
+    for k, v in overrides.items():
+        for sub in (cfg.signal, cfg.cointegration, cfg.portfolio):
+            if hasattr(sub, k):
+                setattr(sub, k, v)
+                break
+    return cfg
+
+
+def _recommended_config(start_date: str, end_date: str, **overrides) -> Config:
+    """Config with the recommended parameter set."""
+    cfg = _make_config(start_date, end_date)
+    cfg.signal.z_entry = 3.0
+    cfg.signal.z_exit  = 0.5
+    cfg.signal.z_stop  = 4.5
+    cfg.cointegration.rolling_window_days = 42
+    for k, v in overrides.items():
+        for sub in (cfg.signal, cfg.cointegration, cfg.portfolio):
+            if hasattr(sub, k):
+                setattr(sub, k, v)
+                break
+    return cfg
+
+
 class TestRunBacktest:
     """Integration-style tests that mock data loading and cointegration."""
 
@@ -253,10 +281,7 @@ class TestRunBacktest:
 
         patches = self._patch_all(pairs, intraday, signals, trading_days)
         with patches[0], patches[1], patches[2], patches[3]:
-            _, daily_pnl = run_backtest(
-                start_date="2023-01-03",
-                end_date="2023-01-03",
-            )
+            _, daily_pnl = run_backtest(config=_make_config("2023-01-03", "2023-01-03"))
 
         capital = CONFIG.portfolio.capital
         assert daily_pnl["portfolio_value"][0] == pytest.approx(capital)
@@ -270,10 +295,7 @@ class TestRunBacktest:
 
         patches = self._patch_all(pairs, intraday, signals, trading_days)
         with patches[0], patches[1], patches[2], patches[3]:
-            _, daily_pnl = run_backtest(
-                start_date="2023-01-03",
-                end_date="2023-01-03",
-            )
+            _, daily_pnl = run_backtest(config=_make_config("2023-01-03", "2023-01-03"))
 
         assert daily_pnl["n_open_eod"][0] == 0
 
@@ -286,10 +308,7 @@ class TestRunBacktest:
 
         patches = self._patch_all(pairs, intraday, signals, trading_days)
         with patches[0], patches[1], patches[2], patches[3]:
-            _, daily_pnl = run_backtest(
-                start_date="2023-01-03",
-                end_date="2023-01-04",
-            )
+            _, daily_pnl = run_backtest(config=_make_config("2023-01-03", "2023-01-04"))
 
         assert (daily_pnl["n_open_eod"] == 0).all()
 
@@ -321,10 +340,7 @@ class TestRunBacktest:
 
         patches = self._patch_all(pairs, intraday, signals_df, trading_days)
         with patches[0], patches[1], patches[2], patches[3]:
-            trades, _ = run_backtest(
-                start_date="2023-01-03",
-                end_date="2023-01-03",
-            )
+            trades, _ = run_backtest(config=_make_config("2023-01-03", "2023-01-03"))
 
         if len(trades) > 0:
             assert trades["exit_time"].is_null().sum() == 0
@@ -337,10 +353,7 @@ class TestRunBacktest:
 
         patches = self._patch_all(empty_pairs, intraday, signals, trading_days)
         with patches[0], patches[1], patches[2], patches[3]:
-            trades, daily_pnl = run_backtest(
-                start_date="2023-01-03",
-                end_date="2023-01-03",
-            )
+            trades, daily_pnl = run_backtest(config=_make_config("2023-01-03", "2023-01-03"))
 
         assert len(trades) == 0
 
@@ -388,7 +401,7 @@ class TestOutputSchemas:
         intraday = _make_intraday_df()
         patches = _patch_all(pairs, intraday, signals_df, trading_days)
         with patches[0], patches[1], patches[2], patches[3]:
-            return run_backtest(start_date="2023-01-03", end_date="2023-01-03")
+            return run_backtest(config=_make_config("2023-01-03", "2023-01-03"))
 
     def test_trades_df_columns_when_no_trades(self):
         trades, _ = self._run_one_day(_make_flat_signals_df("A", "B"))
@@ -411,9 +424,7 @@ class TestOutputSchemas:
         signals = _make_flat_signals_df("A", "B")
         patches = _patch_all(pairs, intraday, signals, trading_days)
         with patches[0], patches[1], patches[2], patches[3]:
-            _, daily_pnl = run_backtest(
-                start_date="2023-01-03", end_date="2023-01-05"
-            )
+            _, daily_pnl = run_backtest(config=_make_config("2023-01-03", "2023-01-05"))
         assert len(daily_pnl) == len(trading_days)
 
 
@@ -421,15 +432,6 @@ class TestOutputSchemas:
 # Recommended parameters (from parameter_search.ipynb analysis)
 #   z_entry=3.0, rolling_window_days=42, max_holding=60min → z_stop=4.5
 # ---------------------------------------------------------------------------
-
-
-# Recommended parameters identified in parameter_search.ipynb
-RECOMMENDED_PARAMS = dict(
-    z_entry=3.0,
-    z_exit=0.5,
-    z_stop=4.5,
-    rolling_window_days=42,
-)
 
 
 class TestRecommendedParams:
@@ -441,16 +443,13 @@ class TestRecommendedParams:
     def _run(self, signals_df, n_days: int = 1, max_pairs: int = 10):
         start = dt.date(2023, 1, 3)
         trading_days = [start + dt.timedelta(days=i) for i in range(n_days)]
+        cfg = _recommended_config(str(start), str(trading_days[-1]))
+        cfg.portfolio.max_pairs = max_pairs
         pairs = _make_minimal_pairs_df()
         intraday = _make_intraday_df(n_bars=12)
         patches = _patch_all(pairs, intraday, signals_df, trading_days)
         with patches[0], patches[1], patches[2], patches[3]:
-            return run_backtest(
-                start_date=str(start),
-                end_date=str(trading_days[-1]),
-                max_pairs=max_pairs,
-                **RECOMMENDED_PARAMS,
-            )
+            return run_backtest(config=cfg)
 
     def test_runs_without_error(self):
         """run_backtest completes with recommended params and returns two DataFrames."""
@@ -562,13 +561,10 @@ class TestRecommendedParams:
         intraday = _make_intraday_df(n_bars=n_bars)
         trading_days = [dt.date(2023, 1, 3)]
         patches = _patch_all(multi_pairs, intraday, multi_signals, trading_days)
+        cfg = _recommended_config("2023-01-03", "2023-01-03")
+        cfg.portfolio.max_pairs = 3
         with patches[0], patches[1], patches[2], patches[3]:
-            trades, _ = run_backtest(
-                start_date="2023-01-03",
-                end_date="2023-01-03",
-                max_pairs=3,
-                **RECOMMENDED_PARAMS,
-            )
+            trades, _ = run_backtest(config=cfg)
 
         # With max_pairs=3, at most 3 positions can be open at once
         assert len(trades) <= 3
@@ -583,11 +579,7 @@ class TestRecommendedParams:
         pairs = _make_minimal_pairs_df()
         patches = _patch_all(pairs, intraday, signals, trading_days)
         with patches[0], patches[1], patches[2], patches[3]:
-            trades, _ = run_backtest(
-                start_date="2023-01-03",
-                end_date="2023-01-03",
-                **RECOMMENDED_PARAMS,
-            )
+            trades, _ = run_backtest(config=_recommended_config("2023-01-03", "2023-01-03"))
         if len(trades) > 0:
             assert (trades["exit_reason"] == "eod").all()
 
@@ -691,6 +683,9 @@ class TestExecLagIntegration:
                 return intraday_1min
             return intraday_15min
 
+        cfg = _recommended_config("2023-01-03", "2023-01-03")
+        cfg.portfolio.execution_lag_minutes = lag
+        cfg.portfolio.execution_price_field = field
         patches = [
             patch("strategy.backtester._get_nyse_trading_days", return_value=trading_days),
             patch("strategy.backtester.find_cointegrated_pairs", return_value=pairs),
@@ -698,13 +693,7 @@ class TestExecLagIntegration:
             patch("strategy.backtester.generate_pair_signals_for_day", return_value=signals),
         ]
         with patches[0], patches[1], patches[2], patches[3]:
-            trades, _ = run_backtest(
-                start_date="2023-01-03",
-                end_date="2023-01-03",
-                execution_lag_minutes=lag,
-                execution_price_field=field,
-                **RECOMMENDED_PARAMS,
-            )
+            trades, _ = run_backtest(config=cfg)
         return trades, call_count["n"]
 
     def test_none_lag_does_not_load_1min(self):
@@ -727,13 +716,10 @@ class TestExecLagIntegration:
             patch("strategy.backtester.load_processed", side_effect=load_side_effect),
             patch("strategy.backtester.generate_pair_signals_for_day", return_value=signals),
         ]
+        cfg = _recommended_config("2023-01-03", "2023-01-03")
+        cfg.portfolio.execution_lag_minutes = None
         with patches[0], patches[1], patches[2], patches[3]:
-            run_backtest(
-                start_date="2023-01-03",
-                end_date="2023-01-03",
-                execution_lag_minutes=None,
-                **RECOMMENDED_PARAMS,
-            )
+            run_backtest(config=cfg)
         # execution_lag_minutes=None must not trigger any 1-min data loads
         assert onemin_calls["n"] == 0, f"Expected 0 1-min loads, got {onemin_calls['n']}"
 
@@ -787,3 +773,103 @@ class TestExecLagIntegration:
         if len(trades) > 0:
             # 15-min midpoint: high=100.5, low=99.5 → 100.0
             assert trades["entry_price_a"][0] == pytest.approx(100.0)
+
+
+# ---------------------------------------------------------------------------
+# Config param effect tests
+# ---------------------------------------------------------------------------
+
+
+class TestConfigParamEffects:
+    """Verify that Config params actually take effect inside run_backtest."""
+
+    def _run(self, cfg: Config, signals_df, n_bars: int = 12):
+        trading_days = [dt.date(2023, 1, 3)]
+        pairs = _make_minimal_pairs_df()
+        intraday = _make_intraday_df(n_bars=n_bars)
+        patches = _patch_all(pairs, intraday, signals_df, trading_days)
+        with patches[0], patches[1], patches[2], patches[3]:
+            return run_backtest(config=cfg)
+
+    def test_no_config_uses_module_default(self):
+        """Omitting config= falls back to module CONFIG without error."""
+        trading_days = [dt.date(2023, 1, 3)]
+        pairs = _make_minimal_pairs_df()
+        intraday = _make_intraday_df()
+        signals = _make_flat_signals_df("A", "B")
+        patches = _patch_all(pairs, intraday, signals, trading_days)
+        with patches[0], patches[1], patches[2], patches[3]:
+            trades, daily_pnl = run_backtest()
+        assert isinstance(trades, pl.DataFrame)
+        assert isinstance(daily_pnl, pl.DataFrame)
+
+    def test_cost_bps_from_config_affects_net_pnl(self):
+        """transaction_cost_bps=0 → net_pnl == gross_pnl; high cost → large deduction."""
+        signals = _make_trade_signals_df("A", "B", [0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0])
+
+        cfg_zero = _recommended_config("2023-01-03", "2023-01-03")
+        cfg_zero.portfolio.transaction_cost_bps = 0.0
+        trades_zero, _ = self._run(cfg_zero, signals)
+
+        cfg_high = _recommended_config("2023-01-03", "2023-01-03")
+        cfg_high.portfolio.transaction_cost_bps = 1000.0
+        trades_high, _ = self._run(cfg_high, signals)
+
+        if len(trades_zero) > 0:
+            # Zero cost → net == gross
+            diff = (trades_zero["net_pnl"] - trades_zero["gross_pnl"]).abs()
+            assert (diff < 1e-9).all()
+
+        if len(trades_high) > 0:
+            # High cost → transaction_cost is large
+            assert (trades_high["transaction_cost"] > trades_zero["transaction_cost"]).all()
+
+    def test_max_pairs_from_config_limits_positions(self):
+        """max_pairs=1 in PortfolioConfig limits simultaneous open positions."""
+        n_bars = 12
+        timestamps = [_ts(i) for i in range(n_bars)]
+        signals_list = [0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+        all_rows = []
+        pairs_data = {"ticker_a": [], "ticker_b": [], "hedge_ratio": [], "p_value": [], "half_life": []}
+        for idx in range(3):
+            ta, tb = f"A{idx}", f"B{idx}"
+            pairs_data["ticker_a"].append(ta)
+            pairs_data["ticker_b"].append(tb)
+            pairs_data["hedge_ratio"].append(1.0)
+            pairs_data["p_value"].append(0.01 * (idx + 1))
+            pairs_data["half_life"].append(10.0)
+            for i, ts in enumerate(timestamps):
+                all_rows.append({
+                    "date": "2023-01-03", "timestamp": ts,
+                    "ticker_a": ta, "ticker_b": tb,
+                    "hedge_ratio": 1.0, "p_value": 0.01 * (idx + 1),
+                    "signal_weight": 1.0, "zscore": 0.0,
+                    "signal_binary": signals_list[i],
+                    "signal_weighted": float(signals_list[i]),
+                })
+        multi_pairs = pl.DataFrame(pairs_data)
+        multi_signals = pl.DataFrame(all_rows, schema={
+            "date": pl.Utf8, "timestamp": pl.Datetime,
+            "ticker_a": pl.Utf8, "ticker_b": pl.Utf8,
+            "hedge_ratio": pl.Float64, "p_value": pl.Float64,
+            "signal_weight": pl.Float64, "zscore": pl.Float64,
+            "signal_binary": pl.Int32, "signal_weighted": pl.Float64,
+        })
+        intraday = _make_intraday_df(n_bars=n_bars)
+        trading_days = [dt.date(2023, 1, 3)]
+
+        cfg = _recommended_config("2023-01-03", "2023-01-03")
+        cfg.portfolio.max_pairs = 1
+        patches = _patch_all(multi_pairs, intraday, multi_signals, trading_days)
+        with patches[0], patches[1], patches[2], patches[3]:
+            trades, _ = run_backtest(config=cfg)
+        assert len(trades) <= 1
+
+    def test_zscore_window_days_from_config_runs_without_error(self):
+        """Different zscore_window_days values both run without error."""
+        signals = _make_flat_signals_df("A", "B")
+        for window in [1, 10]:
+            cfg = _recommended_config("2023-01-03", "2023-01-03")
+            cfg.signal.zscore_window_days = window
+            trades, _ = self._run(cfg, signals)
+            assert isinstance(trades, pl.DataFrame)

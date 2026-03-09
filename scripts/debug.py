@@ -14,16 +14,17 @@ sys.path.insert(0, "/Users/erevtsov/dev/stat-arb")
 import polars as pl
 
 from strategy.backtester import run_backtest
+from utils.config import Config
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Run baseline backtest
 # ─────────────────────────────────────────────────────────────────────────────
 print("Running full-period backtest at 1.5 bps...")
-trades, daily_pnl = run_backtest(
-    start_date="2022-07-01",
-    end_date="2024-12-31",
-    cost_bps=1.5,
-)
+cfg = Config()
+cfg.portfolio.start_date = "2022-07-01"
+cfg.portfolio.end_date = "2024-12-31"
+cfg.portfolio.transaction_cost_bps = 1.5
+trades, daily_pnl = run_backtest(config=cfg)
 
 final_value = daily_pnl["portfolio_value"].tail(1)[0]
 ret = (final_value - 100_000) / 100_000 * 100
