@@ -55,10 +55,10 @@ from utils.config import (
 
 SIGNAL_GRID: dict[str, list] = {
     "zscore_window_days": [2, 5, 10],
-    "z_entry": [3.0, 3.5, 4],
-    "z_exit": [1.5, 2, 2.5],
-    "z_stop": [4.5],
-    "max_holding_minutes": [120, 240, 390],
+    "z_entry": [2.5, 3.0, 3.5, 4],
+    "z_exit": [1.5, 2, 2.4],
+    "z_stop": [4.5, 5.0],
+    "max_holding_minutes": [60, 120, 240, 390],
     "fixed_exit_norm": [True, False],
 }
 
@@ -72,7 +72,7 @@ SIGNAL_GRID: dict[str, list] = {
 FORMATION_GRID: dict[str, list] = {
     "rolling_window_days": [42],
     "min_half_life": [4],
-    "max_half_life": [12],
+    "max_half_life": [24],
     "p_value_threshold": [0.05],
 }
 

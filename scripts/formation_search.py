@@ -229,10 +229,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Formation parameter quality sweep")
     parser.add_argument("--timeframe", default="15min")
     parser.add_argument(
-        "--start", default="2022-07-01", help="Eval start date (YYYY-MM-DD)"
+        "--start", default="2017-01-01", help="Eval start date (YYYY-MM-DD)"
     )
     parser.add_argument(
-        "--end", default="2022-09-30", help="Eval end date (YYYY-MM-DD)"
+        "--end", default="2018-12-31", help="Eval end date (YYYY-MM-DD)"
     )
     parser.add_argument(
         "--output",
