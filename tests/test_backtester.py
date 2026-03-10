@@ -873,3 +873,138 @@ class TestConfigParamEffects:
             cfg.signal.zscore_window_days = window
             trades, _ = self._run(cfg, signals)
             assert isinstance(trades, pl.DataFrame)
+
+
+# ---------------------------------------------------------------------------
+# Position sizing tests
+# ---------------------------------------------------------------------------
+
+
+class TestPositionSizing:
+    """
+    Verify dollar-neutral position sizing:
+      shares_a * entry_price_a == notional_per_pair
+      shares_b * entry_price_b == hedge_ratio * notional_per_pair
+
+    Regression for the bug where shares_b = hedge_ratio * shares_a (divides by
+    price_a instead of price_b), which oversizes leg B by price_b / price_a.
+    """
+
+    def _run_with_entry_prices(
+        self,
+        price_a: float,
+        price_b: float,
+        hedge_ratio: float = 1.0,
+        capital: float = 100_000.0,
+        max_pairs: int = 10,
+    ):
+        """
+        Run a one-day backtest with controlled entry prices and hedge ratio.
+
+        load_processed is mocked so ticker A always returns bars at price_a and
+        ticker B always returns bars at price_b. Entry fires at bar 1 → executes
+        at bar 2 midpoint (= base_price exactly).
+        """
+        n_bars = 8
+        # bar 0: flat, bar 1: enter, bars 2-7: hold → forced EOD close
+        signals = _make_trade_signals_df("A", "B", [0, 1, 1, 1, 1, 1, 1, 1])
+        pairs = pl.DataFrame({
+            "ticker_a": ["A"],
+            "ticker_b": ["B"],
+            "hedge_ratio": [hedge_ratio],
+            "p_value": [0.01],
+            "half_life": [10.0],
+        })
+        intraday_a = _make_intraday_df(n_bars=n_bars, base_price=price_a)
+        intraday_b = _make_intraday_df(n_bars=n_bars, base_price=price_b)
+        trading_days = [dt.date(2023, 1, 3)]
+
+        def load_side_effect(ticker, timeframe, **kwargs):
+            if ticker == "A":
+                return intraday_a
+            if ticker == "B":
+                return intraday_b
+            return None  # all other tickers → skipped by _load_day_prices
+
+        cfg = _make_config("2023-01-03", "2023-01-03")
+        cfg.portfolio.capital = capital
+        cfg.portfolio.max_pairs = max_pairs
+        cfg.portfolio.min_bars_remaining = 0  # don't block any entries
+
+        patches = [
+            patch("strategy.backtester._get_nyse_trading_days", return_value=trading_days),
+            patch("strategy.backtester.find_cointegrated_pairs", return_value=pairs),
+            patch("strategy.backtester.load_processed", side_effect=load_side_effect),
+            patch("strategy.backtester.generate_pair_signals_for_day", return_value=signals),
+            # Restrict universe to ["A", "B"] so _price_cache loads our test data
+            patch("strategy.backtester.get_all_tickers", return_value=["A", "B"]),
+        ]
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            trades, _ = run_backtest(config=cfg)
+        return trades
+
+    def test_leg_a_notional_equals_notional_per_pair(self):
+        """shares_a * entry_price_a == notional_per_pair for any prices."""
+        capital, max_pairs = 100_000.0, 10
+        trades = self._run_with_entry_prices(price_a=50.0, price_b=500.0,
+                                              capital=capital, max_pairs=max_pairs)
+        assert len(trades) > 0, "No trades produced — check entry logic"
+        notional_per_pair = capital / max_pairs
+        assert trades["shares_a"][0] * trades["entry_price_a"][0] == pytest.approx(
+            notional_per_pair, rel=1e-6
+        )
+
+    def test_leg_b_notional_equals_hedge_ratio_times_notional(self):
+        """abs(shares_b * entry_price_b) == abs(hedge_ratio) * notional_per_pair."""
+        capital, max_pairs = 100_000.0, 10
+        hedge_ratio = 2.5
+        trades = self._run_with_entry_prices(price_a=50.0, price_b=500.0,
+                                              hedge_ratio=hedge_ratio,
+                                              capital=capital, max_pairs=max_pairs)
+        assert len(trades) > 0, "No trades produced — check entry logic"
+        notional_per_pair = capital / max_pairs
+        assert abs(trades["shares_b"][0] * trades["entry_price_b"][0]) == pytest.approx(
+            abs(hedge_ratio) * notional_per_pair, rel=1e-6
+        )
+
+    def test_price_imbalanced_pair_not_oversized(self):
+        """
+        Regression: price_b/price_a = 100x must NOT inflate leg B notional 100x.
+
+        Old bug: shares_b = hedge_ratio * shares_a = hedge_ratio * notional / price_a
+        For price_a=$10, price_b=$1000, hedge_ratio=1: leg B got 100x too large.
+        """
+        capital, max_pairs = 100_000.0, 10
+        notional_per_pair = capital / max_pairs
+        trades = self._run_with_entry_prices(price_a=10.0, price_b=1000.0,
+                                              hedge_ratio=1.0,
+                                              capital=capital, max_pairs=max_pairs)
+        assert len(trades) > 0, "No trades produced — check entry logic"
+        notional_a = trades["shares_a"][0] * trades["entry_price_a"][0]
+        notional_b = abs(trades["shares_b"][0] * trades["entry_price_b"][0])
+        assert notional_a == pytest.approx(notional_per_pair, rel=1e-6)
+        assert notional_b == pytest.approx(notional_per_pair, rel=1e-6)
+
+    def test_notional_invariant_to_price_ratio(self):
+        """For hedge_ratio=1, both legs have equal notional regardless of price ratio."""
+        capital, max_pairs = 100_000.0, 10
+        notional_per_pair = capital / max_pairs
+        for price_a, price_b in [(10.0, 1000.0), (100.0, 100.0), (500.0, 5.0)]:
+            trades = self._run_with_entry_prices(price_a=price_a, price_b=price_b,
+                                                  hedge_ratio=1.0,
+                                                  capital=capital, max_pairs=max_pairs)
+            assert len(trades) > 0, f"No trades for price_a={price_a}, price_b={price_b}"
+            notional_a = trades["shares_a"][0] * trades["entry_price_a"][0]
+            notional_b = abs(trades["shares_b"][0] * trades["entry_price_b"][0])
+            assert notional_a == pytest.approx(notional_per_pair, rel=1e-6), \
+                f"Leg A notional wrong for price_a={price_a}, price_b={price_b}"
+            assert notional_b == pytest.approx(notional_per_pair, rel=1e-6), \
+                f"Leg B notional wrong for price_a={price_a}, price_b={price_b}"
+
+    def test_negative_hedge_ratio(self):
+        """Negative hedge_ratio produces shares_b with opposite sign to shares_a."""
+        trades = self._run_with_entry_prices(price_a=100.0, price_b=100.0, hedge_ratio=-1.5)
+        assert len(trades) > 0, "No trades produced — check entry logic"
+        # shares_a > 0 (long); shares_b < 0 when hedge_ratio < 0
+        assert trades["shares_a"][0] > 0
+        assert trades["shares_b"][0] < 0

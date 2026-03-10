@@ -14,7 +14,7 @@ Execution prices:
 Position sizing:
   - notional_per_pair = portfolio_value / max_pairs
   - shares_a = notional / entry_price_a
-  - shares_b = hedge_ratio * shares_a  (for dollar-neutral pair)
+  - shares_b = hedge_ratio * notional / entry_price_b  (dollar-neutral: each leg has notional β×N)
 """
 
 from __future__ import annotations
@@ -647,7 +647,7 @@ def run_backtest(config: Config | None = None) -> tuple[pl.DataFrame, pl.DataFra
                     continue
 
                 shares_a = notional_per_pair / entry_price_a
-                shares_b = pair_row["hedge_ratio"] * shares_a
+                shares_b = pair_row["hedge_ratio"] * notional_per_pair / entry_price_b
 
                 open_positions[pair_key] = PositionState(
                     direction=sig,
