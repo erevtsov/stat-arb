@@ -28,15 +28,21 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import os
+import subprocess
+import textwrap
 from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
 import polars as pl
+from dotenv import load_dotenv
 
 from analysis.cointegration import find_cointegrated_pairs
 from analysis.preprocessing import load_processed
 from utils.config import CONFIG, get_all_tickers
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # ---------------------------------------------------------------------------
 # Formation parameter grid
@@ -221,6 +227,56 @@ def _eval_formation_combo(
 
 
 # ---------------------------------------------------------------------------
+# Email notification
+# ---------------------------------------------------------------------------
+
+def _send_completion_imessage(
+    results_df: pl.DataFrame,
+    survivors: pl.DataFrame,
+    args: argparse.Namespace,
+) -> None:
+    """Send an iMessage via the macOS Messages app (osascript). No credentials needed."""
+    notify_to = os.environ.get("NOTIFY_IMESSAGE_TO")
+    if not notify_to:
+        print("\nWarning: NOTIFY_IMESSAGE_TO not set in .env — skipping iMessage notification")
+        return
+
+    top5_lines = results_df.head(5).select(
+        ["rolling_window_days", "p_value_threshold", "composite_score",
+         "mean_n_pairs", "split_consistency_rate"]
+    ).to_pandas().to_string(index=False)
+
+    text = textwrap.dedent(f"""\
+        [stat-arb] formation_search done
+        Period: {args.start} → {args.end} | tf: {args.timeframe}
+        Combos evaluated: {len(results_df)}  passing: {len(survivors)}
+
+        Top 5:
+        {top5_lines}
+    """).strip()
+
+    # Escape backslashes and double-quotes for AppleScript string literal
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'tell application "Messages" to send "{escaped}" '
+        f'to buddy "{notify_to}" of '
+        f'(first service whose service type is iMessage)'
+    )
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            print(f"\nNotification iMessage sent → {notify_to}")
+        else:
+            print(f"\nWarning: osascript exited {result.returncode}: {result.stderr.decode().strip()}")
+    except Exception as exc:
+        print(f"\nWarning: could not send iMessage ({exc})")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -315,6 +371,8 @@ def main() -> None:
         )
     else:
         print("No combos passed all thresholds. Consider relaxing QUALITY_THRESHOLDS.")
+
+    _send_completion_imessage(results_df, survivors, args)
 
 
 if __name__ == "__main__":

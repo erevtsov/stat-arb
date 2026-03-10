@@ -31,11 +31,15 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import os
+import subprocess
+import textwrap
 from datetime import date, timedelta
 from multiprocessing import get_context
 from pathlib import Path
 
 import polars as pl
+from dotenv import load_dotenv
 
 from analysis.cointegration import find_cointegrated_pairs
 from analysis.evaluation import evaluate_all
@@ -48,6 +52,8 @@ from utils.config import (
     get_all_tickers,
     holding_horizons_bars,
 )
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # ---------------------------------------------------------------------------
 # Parameter grids
@@ -532,6 +538,57 @@ def main() -> None:
         f"{n_positive_ic}/{total} combos have mean_ic_gross > 0 | "
         f"{n_positive_net}/{total} have mean_net_return > 0"
     )
+
+    _send_completion_imessage(results_df, args, shortest_h, n_positive_ic, total, output_path)
+
+
+def _send_completion_imessage(
+    results_df: pl.DataFrame,
+    args: argparse.Namespace,
+    shortest_h: int,
+    n_positive_ic: int,
+    total: int,
+    output_path: Path,
+) -> None:
+    """Send an iMessage via the macOS Messages app (osascript). No credentials needed."""
+    notify_to = os.environ.get("NOTIFY_IMESSAGE_TO")
+    if not notify_to:
+        print("\nWarning: NOTIFY_IMESSAGE_TO not set in .env — skipping iMessage notification")
+        return
+
+    top5 = (
+        results_df.filter(pl.col("n_bars") == shortest_h)
+        .sort("mean_ic_gross", descending=True)
+        .head(5)
+        .select(["zscore_window_days", "z_entry", "z_exit", "mean_ic_gross", "mean_net_return"])
+        .to_pandas()
+        .to_string(index=False)
+    )
+
+    text = textwrap.dedent(f"""\
+        [stat-arb] grid_search_v2 done (phase {args.phase})
+        Period: {args.start} → {args.end} | tf: {args.timeframe}
+        {n_positive_ic}/{total} combos with positive IC at {shortest_h}-bar horizon
+        Output: {output_path}
+
+        Top 5 by IC:
+        {top5}
+    """).strip()
+
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'tell application "Messages" to send "{escaped}" '
+        f'to buddy "{notify_to}" of '
+        f'(first service whose service type is iMessage)'
+    )
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=15)
+        if result.returncode == 0:
+            print(f"\nNotification iMessage sent → {notify_to}")
+        else:
+            print(f"\nWarning: osascript exited {result.returncode}: {result.stderr.decode().strip()}")
+    except Exception as exc:
+        print(f"\nWarning: could not send iMessage ({exc})")
 
 
 if __name__ == "__main__":
