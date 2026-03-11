@@ -31,6 +31,7 @@ import itertools
 import os
 import subprocess
 import textwrap
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -65,6 +66,29 @@ QUALITY_THRESHOLDS: dict[str, float] = {
     "pct_days_with_pairs": 0.50,
     "split_consistency_rate": 0.40,
 }
+
+
+# ---------------------------------------------------------------------------
+# Parallel worker state (module-level globals required for spawn-based
+# multiprocessing on macOS — closures and lambdas are not picklable)
+# ---------------------------------------------------------------------------
+
+_worker_price_cache: dict = {}
+_worker_timeframe: str = ""
+
+
+def _init_worker(cache: dict, timeframe: str) -> None:
+    """Set per-process state once when each worker is spawned."""
+    global _worker_price_cache, _worker_timeframe
+    _worker_price_cache = cache
+    _worker_timeframe = timeframe
+
+
+def _eval_combo_worker(combo: dict, eval_dates: list[date]) -> dict:
+    """Top-level picklable wrapper used by ProcessPoolExecutor."""
+    return _eval_formation_combo(
+        combo, eval_dates, _worker_price_cache, _worker_timeframe
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +254,7 @@ def _eval_formation_combo(
 # Email notification
 # ---------------------------------------------------------------------------
 
+
 def _send_completion_imessage(
     results_df: pl.DataFrame,
     survivors: pl.DataFrame,
@@ -238,13 +263,25 @@ def _send_completion_imessage(
     """Send an iMessage via the macOS Messages app (osascript). No credentials needed."""
     notify_to = os.environ.get("NOTIFY_IMESSAGE_TO")
     if not notify_to:
-        print("\nWarning: NOTIFY_IMESSAGE_TO not set in .env — skipping iMessage notification")
+        print(
+            "\nWarning: NOTIFY_IMESSAGE_TO not set in .env — skipping iMessage notification"
+        )
         return
 
-    top5_lines = results_df.head(5).select(
-        ["rolling_window_days", "p_value_threshold", "composite_score",
-         "mean_n_pairs", "split_consistency_rate"]
-    ).to_pandas().to_string(index=False)
+    top5_lines = (
+        results_df.head(5)
+        .select(
+            [
+                "rolling_window_days",
+                "p_value_threshold",
+                "composite_score",
+                "mean_n_pairs",
+                "split_consistency_rate",
+            ]
+        )
+        .to_pandas()
+        .to_string(index=False)
+    )
 
     text = textwrap.dedent(f"""\
         [stat-arb] formation_search done
@@ -260,7 +297,7 @@ def _send_completion_imessage(
     script = (
         f'tell application "Messages" to send "{escaped}" '
         f'to buddy "{notify_to}" of '
-        f'(first service whose service type is iMessage)'
+        f"(first service whose service type is iMessage)"
     )
     try:
         result = subprocess.run(
@@ -271,7 +308,9 @@ def _send_completion_imessage(
         if result.returncode == 0:
             print(f"\nNotification iMessage sent → {notify_to}")
         else:
-            print(f"\nWarning: osascript exited {result.returncode}: {result.stderr.decode().strip()}")
+            print(
+                f"\nWarning: osascript exited {result.returncode}: {result.stderr.decode().strip()}"
+            )
     except Exception as exc:
         print(f"\nWarning: could not send iMessage ({exc})")
 
@@ -293,6 +332,12 @@ def main() -> None:
     parser.add_argument(
         "--output",
         default=str(Path(CONFIG.paths.results_dir) / "formation_search.parquet"),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 1) - 4),
+        help="Parallel worker processes (default: CPU count)",
     )
     args = parser.parse_args()
 
@@ -323,19 +368,34 @@ def main() -> None:
     price_cache = load_all_prices(args.timeframe, data_start, data_end)
     print(f"Loaded {len(price_cache)} tickers\n")
 
-    # Evaluate each combo
+    # Evaluate combos in parallel across worker processes.
+    # macOS uses "spawn" (not "fork"), so worker state is set via initializer
+    # rather than inherited — price_cache is sent once per worker, not per task.
+    n_workers = min(args.workers, len(formation_combos))
+    print(f"Running {len(formation_combos)} combos across {n_workers} workers...\n")
+
     all_results: list[dict] = []
-    for i, combo in enumerate(formation_combos, 1):
-        print(f"[{i:2d}/{len(formation_combos)}] {combo}")
-        result = _eval_formation_combo(combo, eval_dates, price_cache, args.timeframe)
-        all_results.append(result)
-        print(
-            f"        n_pairs={result['mean_n_pairs']:.1f}  "
-            f"split_rate={result['split_consistency_rate']:.2%}  "
-            f"sectors={result['mean_n_sectors']:.1f}  "
-            f"hr_cv={result['mean_hedge_ratio_cv']}  "
-            f"score={result['composite_score']:.4f}"
-        )
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_init_worker,
+        initargs=(price_cache, args.timeframe),
+    ) as pool:
+        future_to_combo = {
+            pool.submit(_eval_combo_worker, combo, eval_dates): (i, combo)
+            for i, combo in enumerate(formation_combos, 1)
+        }
+        for future in as_completed(future_to_combo):
+            i, combo = future_to_combo[future]
+            result = future.result()
+            all_results.append(result)
+            print(
+                f"[{i:2d}/{len(formation_combos)}] {combo}\n"
+                f"        n_pairs={result['mean_n_pairs']:.1f}  "
+                f"split_rate={result['split_consistency_rate']:.2%}  "
+                f"sectors={result['mean_n_sectors']:.1f}  "
+                f"hr_cv={result['mean_hedge_ratio_cv']}  "
+                f"score={result['composite_score']:.4f}"
+            )
 
     results_df = pl.DataFrame(all_results).sort("composite_score", descending=True)
 
