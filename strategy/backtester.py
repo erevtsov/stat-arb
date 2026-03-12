@@ -12,7 +12,9 @@ Execution prices:
   - EOD forced exit: close of the last bar.
 
 Position sizing:
-  - notional_per_pair = portfolio_value / max_pairs
+  - Equal (default): notional_per_pair = portfolio_value / max_pairs
+  - P-value weighted (use_pvalue_weights=True): notional proportional to -log(p_value),
+    normalized over top max_pairs pairs by p_value; weights sum to 1.
   - shares_a = notional / entry_price_a
   - shares_b = hedge_ratio * notional / entry_price_b  (dollar-neutral: each leg has notional β×N)
 """
@@ -219,6 +221,7 @@ def run_backtest(config: Config | None = None) -> tuple[pl.DataFrame, pl.DataFra
     max_pairs             = cfg.portfolio.max_pairs
     capital               = cfg.portfolio.capital
     cost_bps              = cfg.portfolio.transaction_cost_bps
+    use_pvalue_weights    = cfg.portfolio.use_pvalue_weights
 
     # Cointegration
     rolling_window_days  = cfg.cointegration.rolling_window_days
@@ -298,6 +301,18 @@ def run_backtest(config: Config | None = None) -> tuple[pl.DataFrame, pl.DataFra
         pairs_df = compute_pvalue_weights(pairs_df)
 
         notional_per_pair = portfolio_value / max_pairs
+
+        if use_pvalue_weights:
+            import math
+            _top = pairs_df.sort("p_value").head(max_pairs)
+            _raw = [-math.log(p) for p in _top["p_value"].to_list()]
+            _total = sum(_raw)
+            _pair_notionals: dict[tuple[str, str], float] = {
+                (row["ticker_a"], row["ticker_b"]): portfolio_value * (w / _total)
+                for row, w in zip(_top.iter_rows(named=True), _raw)
+            }
+        else:
+            _pair_notionals = {}
 
         # Determine all tickers needed today
         all_tickers_today: list[str] = list(
@@ -646,8 +661,9 @@ def run_backtest(config: Config | None = None) -> tuple[pl.DataFrame, pl.DataFra
                 if entry_price_a <= 0 or entry_price_b <= 0:
                     continue
 
-                shares_a = notional_per_pair / entry_price_a
-                shares_b = pair_row["hedge_ratio"] * notional_per_pair / entry_price_b
+                _notional = _pair_notionals.get((ticker_a, ticker_b), notional_per_pair)
+                shares_a = _notional / entry_price_a
+                shares_b = pair_row["hedge_ratio"] * _notional / entry_price_b
 
                 open_positions[pair_key] = PositionState(
                     direction=sig,

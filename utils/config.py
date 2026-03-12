@@ -109,6 +109,8 @@ class PortfolioConfig:
         "open"  # 1-min bar field used when execution_lag_minutes
     )
     # is set; one of "open", "high", "low", "close", "mid"
+    use_pvalue_weights: bool = False  # if True, size pairs by -log(p_value) weight
+    # (normalized over top max_pairs by p_value) instead of equal notional
 
 
 @dataclass

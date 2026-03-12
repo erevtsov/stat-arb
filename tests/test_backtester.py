@@ -1008,3 +1008,161 @@ class TestPositionSizing:
         # shares_a > 0 (long); shares_b < 0 when hedge_ratio < 0
         assert trades["shares_a"][0] > 0
         assert trades["shares_b"][0] < 0
+
+
+# ---------------------------------------------------------------------------
+# P-value weighted position sizing
+# ---------------------------------------------------------------------------
+
+
+class TestPvalueWeightedSizing:
+    """Tests for use_pvalue_weights=True: -log(p_value) normalized weights."""
+
+    # ── unit tests: weight math ──────────────────────────────────────────
+
+    def test_weights_sum_to_one(self):
+        import math
+        p_values = [0.001, 0.01, 0.05]
+        raw = [-math.log(p) for p in p_values]
+        total = sum(raw)
+        weights = [r / total for r in raw]
+        assert abs(sum(weights) - 1.0) < 1e-12
+
+    def test_lower_pvalue_gets_higher_weight(self):
+        """Stronger cointegration (lower p) → larger weight."""
+        import math
+        p_values = [0.001, 0.01, 0.05]
+        raw = [-math.log(p) for p in p_values]
+        total = sum(raw)
+        weights = [r / total for r in raw]
+        assert weights[0] > weights[1] > weights[2]
+
+    def test_very_small_pvalue_no_overflow(self):
+        """p=1e-15 must not produce inf or nan via -log(p)."""
+        import math
+        for p in [1e-6, 1e-10, 1e-15]:
+            w = -math.log(p)
+            assert math.isfinite(w)
+            assert w > 0
+
+    def test_weight_ratio_matches_log_ratio(self):
+        """Weight ratio between two pairs equals their -log(p) ratio."""
+        import math
+        p1, p2 = 0.01, 0.04
+        raw1, raw2 = -math.log(p1), -math.log(p2)
+        total = raw1 + raw2
+        w1, w2 = raw1 / total, raw2 / total
+        assert w1 / w2 == pytest.approx(raw1 / raw2, rel=1e-9)
+
+    # ── integration tests: notional in backtest ──────────────────────────
+
+    def _run_two_pairs(self, p_values: list[float], price: float = 100.0,
+                       use_pvalue_weights: bool = True, capital: float = 100_000.0):
+        """
+        Run a one-day backtest with two pairs both entering at bar 1.
+        Both pairs use price_a = price_b = price (equal prices → easy notional check).
+        Returns trades sorted by p_value ascending.
+        """
+        n_bars = 8
+        tickers = [("A0", "B0"), ("A1", "B1")]
+        pairs_data = {
+            "ticker_a": [t[0] for t in tickers],
+            "ticker_b": [t[1] for t in tickers],
+            "hedge_ratio": [1.0, 1.0],
+            "p_value": p_values,
+            "half_life": [10.0, 10.0],
+        }
+        signals_list = [0, 1, 1, 1, 1, 1, 1, 1]
+        all_rows = []
+        for (ta, tb), pv in zip(tickers, p_values):
+            for i, ts in enumerate([_ts(j) for j in range(n_bars)]):
+                all_rows.append({
+                    "date": "2023-01-03", "timestamp": ts,
+                    "ticker_a": ta, "ticker_b": tb,
+                    "hedge_ratio": 1.0, "p_value": pv,
+                    "signal_weight": 1.0, "zscore": 0.0,
+                    "signal_binary": signals_list[i],
+                    "signal_weighted": float(signals_list[i]),
+                })
+
+        multi_pairs = pl.DataFrame(pairs_data)
+        multi_signals = pl.DataFrame(all_rows, schema={
+            "date": pl.Utf8, "timestamp": pl.Datetime,
+            "ticker_a": pl.Utf8, "ticker_b": pl.Utf8,
+            "hedge_ratio": pl.Float64, "p_value": pl.Float64,
+            "signal_weight": pl.Float64, "zscore": pl.Float64,
+            "signal_binary": pl.Int32, "signal_weighted": pl.Float64,
+        })
+        intraday = _make_intraday_df(n_bars=n_bars, base_price=price)
+        trading_days = [dt.date(2023, 1, 3)]
+
+        cfg = _make_config("2023-01-03", "2023-01-03")
+        cfg.portfolio.capital = capital
+        cfg.portfolio.max_pairs = 10
+        cfg.portfolio.min_bars_remaining = 0
+        cfg.portfolio.use_pvalue_weights = use_pvalue_weights
+
+        all_tickers = [t for pair in tickers for t in pair]
+        patches = [
+            patch("strategy.backtester._get_nyse_trading_days", return_value=trading_days),
+            patch("strategy.backtester.find_cointegrated_pairs", return_value=multi_pairs),
+            patch("strategy.backtester.load_processed", return_value=intraday),
+            patch("strategy.backtester.generate_pair_signals_for_day", return_value=multi_signals),
+            patch("strategy.backtester.get_all_tickers", return_value=all_tickers),
+        ]
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            trades, _ = run_backtest(config=cfg)
+
+        # Sort by ticker_a ("A0" < "A1") so index 0 always corresponds to p_values[0]
+        return trades.sort("ticker_a")
+
+    def test_pvalue_weighted_notionals_differ(self):
+        """Two pairs with different p-values get different notionals."""
+        trades = self._run_two_pairs([0.005, 0.04])
+        assert len(trades) == 2
+        notional_0 = trades["shares_a"][0] * trades["entry_price_a"][0]
+        notional_1 = trades["shares_a"][1] * trades["entry_price_a"][1]
+        assert notional_0 != pytest.approx(notional_1, rel=0.01)
+
+    def test_pvalue_weighted_notional_ratio(self):
+        """Notional ratio matches -log(p) ratio."""
+        import math
+        p0, p1 = 0.005, 0.04
+        trades = self._run_two_pairs([p0, p1], price=100.0, capital=100_000.0)
+        assert len(trades) == 2
+        notional_0 = trades["shares_a"][0] * trades["entry_price_a"][0]
+        notional_1 = trades["shares_a"][1] * trades["entry_price_a"][1]
+        expected_ratio = -math.log(p0) / -math.log(p1)
+        assert notional_0 / notional_1 == pytest.approx(expected_ratio, rel=1e-4)
+
+    def test_pvalue_weighted_notionals_sum_to_capital(self):
+        """Total notional of all open positions = capital (both pairs same price)."""
+        capital = 100_000.0
+        trades = self._run_two_pairs([0.005, 0.04], price=100.0, capital=capital)
+        assert len(trades) == 2
+        total_notional = sum(
+            trades["shares_a"][i] * trades["entry_price_a"][i]
+            for i in range(len(trades))
+        )
+        assert total_notional == pytest.approx(capital, rel=1e-4)
+
+    def test_equal_pvalues_give_equal_notionals(self):
+        """When both pairs have the same p-value, notionals are equal."""
+        capital = 100_000.0
+        trades = self._run_two_pairs([0.02, 0.02], price=100.0, capital=capital)
+        assert len(trades) == 2
+        notional_0 = trades["shares_a"][0] * trades["entry_price_a"][0]
+        notional_1 = trades["shares_a"][1] * trades["entry_price_a"][1]
+        assert notional_0 == pytest.approx(notional_1, rel=1e-6)
+
+    def test_default_is_equal_weight_not_pvalue(self):
+        """With use_pvalue_weights=False (default), both pairs get equal notional."""
+        capital = 100_000.0
+        trades = self._run_two_pairs([0.005, 0.04], price=100.0, capital=capital,
+                                     use_pvalue_weights=False)
+        assert len(trades) == 2
+        notional_0 = trades["shares_a"][0] * trades["entry_price_a"][0]
+        notional_1 = trades["shares_a"][1] * trades["entry_price_a"][1]
+        # Equal weight: both get capital / max_pairs = 10_000
+        assert notional_0 == pytest.approx(capital / 10, rel=1e-6)
+        assert notional_1 == pytest.approx(capital / 10, rel=1e-6)
