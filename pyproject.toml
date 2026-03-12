@@ -23,6 +23,7 @@ dependencies = [
     "python-dateutil>=2.8.0",
     "seaborn>=0.13.2",
     "python-dotenv>=1.2.2",
+    "yfinance>=1.2.0",
 ]
 
 [project.scripts]
