@@ -34,9 +34,11 @@ import itertools
 import os
 import subprocess
 import textwrap
-from datetime import date, timedelta
-from multiprocessing import get_context
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import TextIO
 
 import polars as pl
 from dotenv import load_dotenv
@@ -56,15 +58,37 @@ from utils.config import (
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 # ---------------------------------------------------------------------------
+# Logging (timestamped, tee'd to console + log file)
+# ---------------------------------------------------------------------------
+
+_log_fh: TextIO | None = None
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    if _log_fh is not None:
+        _log_fh.write(line + "\n")
+        _log_fh.flush()
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Format a duration in seconds as HH:MM:SS."""
+    s = int(seconds)
+    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+# ---------------------------------------------------------------------------
 # Parameter grids
 # ---------------------------------------------------------------------------
 
 SIGNAL_GRID: dict[str, list] = {
     "zscore_window_days": [2, 5, 10],
-    "z_entry": [2.5, 3.0, 3.5, 4],
+    "z_entry": [2.5, 3.0, 3.5],
     "z_exit": [1.5, 2, 2.4],
     "z_stop": [4.5, 5.0],
-    "max_holding_minutes": [60, 120, 240, 390],
+    "max_holding_minutes": [120, 240, 390],
     "fixed_exit_norm": [True, False],
 }
 
@@ -76,9 +100,9 @@ SIGNAL_GRID: dict[str, list] = {
 #     "p_value_threshold": [0.01, 0.05],
 # }
 FORMATION_GRID: dict[str, list] = {
-    "rolling_window_days": [42],
-    "min_half_life": [4],
-    "max_half_life": [24],
+    "rolling_window_days": [42, 84],
+    "min_half_life": [2],
+    "max_half_life": [12, 24],
     "p_value_threshold": [0.05],
 }
 
@@ -112,6 +136,10 @@ def _init_worker(
 ) -> None:
     """Initialize per-worker globals. Called once per worker process at pool startup."""
     global _pairs_cache, _full_prices, _holding_bars, _cost_bps, _timeframe
+    # Limit Polars' rayon thread pool to 1 per worker process.
+    # Without this, each of N workers spawns ~8 rayon threads → N×8 threads competing
+    # on the same cores, causing massive context-switch overhead.
+    os.environ["POLARS_MAX_THREADS"] = "1"
     _pairs_cache = pairs_cache
     _full_prices = full_prices
     _holding_bars = holding_bars
@@ -158,20 +186,17 @@ def _eval_combo(combo: dict) -> list[dict] | None:
         current_date = date.fromisoformat(date_str)
         lookback_start = current_date - timedelta(days=lookback_calendar_days)
 
-        day_prices: dict[str, pl.DataFrame] = {
-            ticker: df.filter(
-                (pl.col("timestamp").dt.date() >= lookback_start)
-                & (pl.col("timestamp").dt.date() <= current_date)
+        # Use pl.lit() to keep date comparisons native (avoids row-by-row Python
+        # datetime conversion). Filter once and reuse the result (eliminates
+        # the previous double-filter anti-pattern).
+        day_prices: dict[str, pl.DataFrame] = {}
+        for ticker, df in _full_prices.items():
+            filtered = df.filter(
+                (pl.col("timestamp").dt.date() >= pl.lit(lookback_start))
+                & (pl.col("timestamp").dt.date() <= pl.lit(current_date))
             )
-            for ticker, df in _full_prices.items()
-            if len(
-                df.filter(
-                    (pl.col("timestamp").dt.date() >= lookback_start)
-                    & (pl.col("timestamp").dt.date() <= current_date)
-                )
-            )
-            > 0
-        }
+            if len(filtered) > 0:
+                day_prices[ticker] = filtered
 
         day_signals = generate_pair_signals_for_day(
             pairs_df=pairs_with_weights,
@@ -357,10 +382,10 @@ def main() -> None:
         "--timeframe", default="15min", help="Bar timeframe (default: 15min)"
     )
     parser.add_argument(
-        "--start", default="2022-07-01", help="Eval period start date (YYYY-MM-DD)"
+        "--start", default="2019-01-01", help="Eval period start date (YYYY-MM-DD)"
     )
     parser.add_argument(
-        "--end", default="2022-09-30", help="Eval period end date (YYYY-MM-DD)"
+        "--end", default="2019-09-30", help="Eval period end date (YYYY-MM-DD)"
     )
     parser.add_argument(
         "--cost-bps",
@@ -409,12 +434,37 @@ def main() -> None:
         dict(zip(s_keys, vals)) for vals in itertools.product(*SIGNAL_GRID.values())
     ]
 
-    print(
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    global _log_fh
+    log_path = output_path.with_suffix(".log")
+    _log_fh = open(log_path, "a")  # noqa: SIM115  (plain open fine here)
+
+    try:
+        _run(args, timeframe, eval_start, eval_end, holding_bars, formation_combos, signal_combos, output_path)
+    finally:
+        _log_fh.close()
+        _log_fh = None
+
+
+def _run(
+    args: argparse.Namespace,
+    timeframe: str,
+    eval_start: date,
+    eval_end: date,
+    holding_bars: list[int],
+    formation_combos: list[dict],
+    signal_combos: list[dict],
+    output_path: Path,
+) -> None:
+    _log(
         f"Phase {args.phase} | {len(formation_combos)} formation × "
         f"{len(signal_combos)} signal = {len(formation_combos) * len(signal_combos)} total combos"
     )
-    print(f"Eval period: {eval_start} → {eval_end} | timeframe: {timeframe}")
-    print(f"Cost: {args.cost_bps} bps/leg ({4 * args.cost_bps} bps round-trip)")
+    _log(f"Eval period: {eval_start} → {eval_end} | timeframe: {timeframe}")
+    _log(f"Cost: {args.cost_bps} bps/leg ({4 * args.cost_bps} bps round-trip)")
+    _log(f"Log: {output_path.with_suffix('.log')}")
 
     # --- Date range for data loading ---
     max_formation_days = max(c["rolling_window_days"] for c in formation_combos)
@@ -426,9 +476,9 @@ def main() -> None:
     ).isoformat()
     data_end = (eval_end + timedelta(days=max_horizon_days + 5)).isoformat()
 
-    print(f"\nLoading prices [{data_start} → {data_end}]...")
+    _log(f"Loading prices [{data_start} → {data_end}]...")
     price_cache = load_all_prices(timeframe, data_start, data_end)
-    print(f"Loaded {len(price_cache)} tickers")
+    _log(f"Loaded {len(price_cache)} tickers")
 
     # --- Eval dates: all calendar days in eval period ---
     eval_dates: list[date] = []
@@ -437,15 +487,20 @@ def main() -> None:
         eval_dates.append(d)
         d += timedelta(days=1)
 
+    # --- Checkpoint directory ---
+    checkpoint_dir = output_path.parent / (output_path.stem + "_checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_EVERY = 25  # overwrite checkpoint file after every N completed combos
+
     # --- Run formation combos sequentially, signal sweep in parallel ---
     all_results: list[dict] = []
 
-    for f_idx, formation_params in enumerate(formation_combos):
-        print(
-            f"\n[{f_idx + 1}/{len(formation_combos)}] Formation params: {formation_params}"
-        )
+    run_start = time.monotonic()
 
-        print("  Building pairs cache (ADF tests)...")
+    for f_idx, formation_params in enumerate(formation_combos):
+        _log(f"[{f_idx + 1}/{len(formation_combos)}] Formation params: {formation_params}")
+
+        _log("  Building pairs cache (ADF tests)...")
         pairs_cache = build_pairs_cache(
             eval_dates=eval_dates,
             timeframe=timeframe,
@@ -457,44 +512,75 @@ def main() -> None:
         mean_pairs = sum(len(v) for v in pairs_cache.values()) / max(
             n_days_with_pairs, 1
         )
-        print(
+        _log(
             f"  Pairs cache: {n_days_with_pairs}/{len(eval_dates)} trading days | "
             f"avg {mean_pairs:.1f} pairs/day"
         )
 
-        ctx = get_context("spawn")
-        n_workers = args.workers or max(1, (ctx.cpu_count() or 2) - 4)
-        print(
-            f"  Sweeping {len(signal_combos)} signal combos with {n_workers} workers..."
+        fp = formation_params
+        checkpoint_path = checkpoint_dir / (
+            f"f{fp['rolling_window_days']}d"
+            f"_hl{fp['min_half_life']}-{fp['max_half_life']}"
+            f"_p{fp['p_value_threshold']}"
+            f"_idx{f_idx:02d}.parquet"
         )
+        formation_results: list[dict] = []
 
-        with ctx.Pool(
-            processes=n_workers,
+        n_workers = args.workers or max(1, (os.cpu_count() or 2) - 4)
+        _log(f"  Sweeping {len(signal_combos)} signal combos with {n_workers} workers...")
+
+        n_valid = 0
+        n_total = len(signal_combos)
+        sweep_start = time.monotonic()
+
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
             initializer=_init_worker,
             initargs=(pairs_cache, price_cache, holding_bars, args.cost_bps, timeframe),
         ) as pool:
-            results_list = pool.map(_eval_combo, signal_combos)
+            future_to_combo = {
+                pool.submit(_eval_combo, combo): combo for combo in signal_combos
+            }
+            for future in as_completed(future_to_combo):
+                rows = future.result()
+                if rows is None:
+                    continue
+                n_valid += 1
+                for row in rows:
+                    formation_results.append({**formation_params, **row})
+                if n_valid % CHECKPOINT_EVERY == 0:
+                    pl.DataFrame(formation_results).write_parquet(str(checkpoint_path))
+                    elapsed = time.monotonic() - sweep_start
+                    rate = n_valid / elapsed if elapsed > 0 else 0
+                    eta = (n_total - n_valid) / rate if rate > 0 else float("inf")
+                    eta_str = _fmt_duration(eta) if eta != float("inf") else "?"
+                    _log(
+                        f"  [checkpoint] {n_valid}/{n_total} combos"
+                        f" | elapsed {_fmt_duration(elapsed)} | ETA ~{eta_str}"
+                        f" → {checkpoint_path.name}"
+                    )
 
-        n_valid = 0
-        for signal_combo, rows in zip(signal_combos, results_list):
-            if rows is None:
-                continue
-            n_valid += 1
-            for row in rows:
-                all_results.append({**formation_params, **row})
+        # Final checkpoint for this formation combo
+        if formation_results:
+            pl.DataFrame(formation_results).write_parquet(str(checkpoint_path))
+            elapsed = time.monotonic() - sweep_start
+            _log(
+                f"  [done] formation {f_idx + 1} | {n_valid}/{n_total} combos"
+                f" | sweep took {_fmt_duration(elapsed)}"
+                f" → {checkpoint_path.name}"
+            )
+        all_results.extend(formation_results)
 
-        print(f"  {n_valid}/{len(signal_combos)} combos produced signals")
+    total_elapsed = time.monotonic() - run_start
 
     if not all_results:
-        print("\nNo results produced. Check date range, data availability, and params.")
+        _log("No results produced. Check date range, data availability, and params.")
         return
 
     results_df = pl.DataFrame(all_results)
 
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     results_df.write_parquet(str(output_path))
-    print(f"\nSaved {len(results_df)} result rows → {output_path}")
+    _log(f"Saved {len(results_df)} result rows → {output_path} (total {_fmt_duration(total_elapsed)})")
 
     # --- Quick summary at shortest horizon ---
     shortest_h = min(holding_bars)
@@ -517,8 +603,8 @@ def main() -> None:
             ]
         )
     )
-    print(f"\nTop 10 signal combos by mean_ic_gross at {shortest_h}-bar horizon:")
-    print(summary)
+    _log(f"Top 10 signal combos by mean_ic_gross at {shortest_h}-bar horizon:")
+    _log(str(summary))
 
     n_positive_ic = (
         results_df.filter(pl.col("n_bars") == shortest_h)
@@ -533,13 +619,15 @@ def main() -> None:
         .height
     )
     total = results_df.filter(pl.col("n_bars") == shortest_h).height
-    print(
-        f"\nDirectional check (at {shortest_h}-bar horizon): "
+    _log(
+        f"Directional check (at {shortest_h}-bar horizon): "
         f"{n_positive_ic}/{total} combos have mean_ic_gross > 0 | "
         f"{n_positive_net}/{total} have mean_net_return > 0"
     )
 
-    _send_completion_imessage(results_df, args, shortest_h, n_positive_ic, total, output_path)
+    _send_completion_imessage(
+        results_df, args, shortest_h, n_positive_ic, total, output_path
+    )
 
 
 def _send_completion_imessage(
@@ -553,14 +641,22 @@ def _send_completion_imessage(
     """Send an iMessage via the macOS Messages app (osascript). No credentials needed."""
     notify_to = os.environ.get("NOTIFY_IMESSAGE_TO")
     if not notify_to:
-        print("\nWarning: NOTIFY_IMESSAGE_TO not set in .env — skipping iMessage notification")
+        _log("Warning: NOTIFY_IMESSAGE_TO not set in .env — skipping iMessage notification")
         return
 
     top5 = (
         results_df.filter(pl.col("n_bars") == shortest_h)
         .sort("mean_ic_gross", descending=True)
         .head(5)
-        .select(["zscore_window_days", "z_entry", "z_exit", "mean_ic_gross", "mean_net_return"])
+        .select(
+            [
+                "zscore_window_days",
+                "z_entry",
+                "z_exit",
+                "mean_ic_gross",
+                "mean_net_return",
+            ]
+        )
         .to_pandas()
         .to_string(index=False)
     )
@@ -579,16 +675,20 @@ def _send_completion_imessage(
     script = (
         f'tell application "Messages" to send "{escaped}" '
         f'to buddy "{notify_to}" of '
-        f'(first service whose service type is iMessage)'
+        f"(first service whose service type is iMessage)"
     )
     try:
-        result = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=15)
+        result = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, timeout=15
+        )
         if result.returncode == 0:
-            print(f"\nNotification iMessage sent → {notify_to}")
+            _log(f"Notification iMessage sent → {notify_to}")
         else:
-            print(f"\nWarning: osascript exited {result.returncode}: {result.stderr.decode().strip()}")
+            _log(
+                f"Warning: osascript exited {result.returncode}: {result.stderr.decode().strip()}"
+            )
     except Exception as exc:
-        print(f"\nWarning: could not send iMessage ({exc})")
+        _log(f"Warning: could not send iMessage ({exc})")
 
 
 if __name__ == "__main__":

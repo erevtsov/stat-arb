@@ -94,7 +94,7 @@ class SignalConfig:
 class PortfolioConfig:
     capital: float = 100_000.0  # starting portfolio value in dollars
     max_pairs: int = 10  # max simultaneous open pair positions
-    transaction_cost_bps: float = 5.0  # one-way cost per leg in basis points
+    transaction_cost_bps: float = 3.0  # one-way cost per leg in basis points
     # Backtest execution params
     start_date: str = "2022-07-01"  # first trading day (YYYY-MM-DD)
     end_date: str = "2024-12-31"  # last trading day (YYYY-MM-DD)
