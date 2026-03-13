@@ -15,12 +15,6 @@ from tqdm import tqdm
 
 from utils.config import CONFIG
 
-# US equity regular market hours (Eastern Time)
-MARKET_OPEN_HOUR = 9
-MARKET_OPEN_MINUTE = 30
-MARKET_CLOSE_HOUR = 16
-MARKET_CLOSE_MINUTE = 0
-
 TIMEFRAMES = {
     "1min": "1m",
     "5min": "5m",
@@ -49,7 +43,7 @@ def load_raw(ticker: str, raw_dir: str | None = None) -> pl.DataFrame:
     Raises:
         FileNotFoundError: If the Parquet file does not exist.
     """
-    raw_dir = raw_dir or CONFIG["raw_dir"]
+    raw_dir = raw_dir or CONFIG.paths.raw_dir
     path = Path(raw_dir) / f"{ticker}.parquet"
     if not path.exists():
         raise FileNotFoundError(
@@ -78,7 +72,7 @@ def load_raw_eod(ticker: str, eod_dir: str | None = None) -> pl.DataFrame:
     Raises:
         FileNotFoundError: If the Parquet file does not exist.
     """
-    eod_dir = eod_dir or CONFIG["raw_eod_dir"]
+    eod_dir = eod_dir or CONFIG.paths.raw_eod_dir
     path = Path(eod_dir) / f"{ticker}.parquet"
     if not path.exists():
         raise FileNotFoundError(
@@ -94,11 +88,59 @@ def load_splits(ticker: str, splits_dir: str | None = None) -> pl.DataFrame | No
 
     Returns DataFrame with at least [date, split] columns.
     """
-    splits_dir = splits_dir or CONFIG["splits_dir"]
+    splits_dir = splits_dir or CONFIG.paths.splits_dir
     path = Path(splits_dir) / f"{ticker}.parquet"
     if not path.exists():
         return None
     return pl.read_parquet(path)
+
+
+def filter_market_hours(
+    df: pl.DataFrame,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    exchange_calendar: str = "NYSE",
+) -> pl.DataFrame:
+    """
+    Filter intraday data to only include regular trading hours.
+
+    Uses pandas_market_calendars to determine valid trading times,
+    excluding after-hours, pre-market trading, and non-trading days.
+
+    Args:
+        df: DataFrame with 'timestamp' column (timezone-aware US/Eastern)
+        start_date: Start date (YYYY-MM-DD). If None, uses min(df.timestamp)
+        end_date: End date (YYYY-MM-DD). If None, uses max(df.timestamp)
+        exchange_calendar: Exchange calendar name (default: NYSE)
+
+    Returns:
+        Filtered DataFrame with only regular market hours
+    """
+    import pandas_market_calendars as pcal
+
+    # Determine date range
+    if start_date is None:
+        start_date = df.select(pl.col("timestamp").min()).item().strftime("%Y-%m-%d")
+    if end_date is None:
+        end_date = df.select(pl.col("timestamp").max()).item().strftime("%Y-%m-%d")
+
+    # Get exchange calendar and schedule
+    calendar = pcal.get_calendar(exchange_calendar)
+    schedule = calendar.schedule(start_date=start_date, end_date=end_date)
+
+    # Generate minute-by-minute valid trading times
+    valid_times = pcal.date_range(schedule, frequency="1min", closed="both")
+
+    # Convert to Polars and match timezone
+    valid_times_series = pl.Series(valid_times).dt.convert_time_zone("US/Eastern")
+    valid_times_df = valid_times_series.dt.cast_time_unit("us").to_frame("timestamp")
+    valid_times_df = valid_times_df.with_columns(pl.lit(True).alias("is_market_hours"))
+
+    # Join and filter
+    df = df.join(valid_times_df, on="timestamp", how="left")
+    df = df.with_columns(pl.col("is_market_hours").fill_null(False))
+
+    return df.filter(pl.col("is_market_hours")).drop("is_market_hours")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -190,23 +232,11 @@ def clean(df: pl.DataFrame) -> pl.DataFrame:
     """
     df = df.unique(subset=["timestamp"]).sort("timestamp")
 
-    # Filter market hours: 09:30 <= time < 16:00
-    df = df.filter(
-        (
-            (pl.col("timestamp").dt.hour() > MARKET_OPEN_HOUR)
-            | (
-                (pl.col("timestamp").dt.hour() == MARKET_OPEN_HOUR)
-                & (pl.col("timestamp").dt.minute() >= MARKET_OPEN_MINUTE)
-            )
-        )
-        & (
-            (pl.col("timestamp").dt.hour() < MARKET_CLOSE_HOUR)
-            | (
-                (pl.col("timestamp").dt.hour() == MARKET_CLOSE_HOUR)
-                & (pl.col("timestamp").dt.minute() == 0)
-            )
-        )
-    )
+    # Filter to regular market hours using exchange calendar
+    df = filter_market_hours(df)
+
+    # Reset the timezone - keep it becomes painful in the longrun
+    df = df.with_columns(pl.col("timestamp").dt.replace_time_zone(time_zone=None))
 
     # Drop nulls and invalid prices
     df = df.drop_nulls(subset=["open", "high", "low", "close"])
@@ -296,8 +326,8 @@ def process_eod_daily(
     Returns:
         Number of daily bars saved.
     """
-    eod_dir = eod_dir or CONFIG["raw_eod_dir"]
-    processed_dir = processed_dir or CONFIG["processed_dir"]
+    eod_dir = eod_dir or CONFIG.paths.raw_eod_dir
+    processed_dir = processed_dir or CONFIG.paths.processed_dir
 
     df = load_raw_eod(ticker, eod_dir)
 
@@ -354,14 +384,14 @@ def preprocess_ticker(
     Returns:
         Dict mapping timeframe -> number of bars saved.
     """
-    raw_dir = raw_dir or CONFIG["raw_dir"]
-    processed_dir = processed_dir or CONFIG["processed_dir"]
-    splits_dir = splits_dir or CONFIG["splits_dir"]
+    raw_dir = raw_dir or CONFIG.paths.raw_dir
+    processed_dir = processed_dir or CONFIG.paths.processed_dir
+    splits_dir = splits_dir or CONFIG.paths.splits_dir
 
     counts: dict[str, int] = {}
 
     # ── EOD daily (from EODHD adjusted_close) ──────────────
-    eod_dir = CONFIG.get("raw_eod_dir")
+    eod_dir = CONFIG.paths.raw_eod_dir
     if eod_dir and (Path(eod_dir) / f"{ticker}.parquet").exists():
         counts["daily"] = process_eod_daily(ticker, eod_dir, processed_dir)
 
@@ -407,9 +437,9 @@ def preprocess_all_tickers(
     Returns:
         Polars DataFrame summarizing bars per timeframe per ticker.
     """
-    raw_dir = raw_dir or CONFIG["raw_dir"]
-    processed_dir = processed_dir or CONFIG["processed_dir"]
-    eod_dir = CONFIG.get("raw_eod_dir", "")
+    raw_dir = raw_dir or CONFIG.paths.raw_dir
+    processed_dir = processed_dir or CONFIG.paths.processed_dir
+    eod_dir = CONFIG.paths.raw_eod_dir
 
     if tickers is None:
         # Collect tickers that have *either* intraday or EOD data
@@ -463,7 +493,7 @@ def load_processed(
     Raises:
         FileNotFoundError: If the processed file does not exist.
     """
-    processed_dir = processed_dir or CONFIG["processed_dir"]
+    processed_dir = processed_dir or CONFIG.paths.processed_dir
     path = Path(processed_dir) / timeframe / f"{ticker}.parquet"
 
     if not path.exists():
@@ -475,14 +505,16 @@ def load_processed(
     # Use scan_parquet for lazy loading with predicate pushdown
     lazy_df = pl.scan_parquet(path)
 
-    # Apply date filters if specified (pushed down to Parquet reader)
+    # Apply date filters using date comparison so that the full end_date day is
+    # included.  Comparing against a datetime literal truncates at midnight and
+    # silently excludes every market-hours bar on end_date.
     if start_date is not None:
         lazy_df = lazy_df.filter(
-            pl.col("timestamp") >= pl.lit(start_date).str.to_datetime()
+            pl.col("timestamp").dt.date() >= pl.lit(start_date).str.to_date()
         )
     if end_date is not None:
         lazy_df = lazy_df.filter(
-            pl.col("timestamp") <= pl.lit(end_date).str.to_datetime()
+            pl.col("timestamp").dt.date() <= pl.lit(end_date).str.to_date()
         )
 
     # Collect the result

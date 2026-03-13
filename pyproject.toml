@@ -21,6 +21,9 @@ dependencies = [
     "pyarrow>=14.0.0",
     "pypdf>=6.7.0",
     "python-dateutil>=2.8.0",
+    "seaborn>=0.13.2",
+    "python-dotenv>=1.2.2",
+    "yfinance>=1.2.0",
 ]
 
 [project.scripts]
@@ -33,4 +36,8 @@ packages = ["analysis", "strategy", "utils", "scripts"]
 dev-dependencies = [
     "pytest>=8.0.0",
     "ruff>=0.4.0",
+    "scipy>=1.11.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
