@@ -2,6 +2,47 @@
 
 ---
 
+## 2026-03-12 — Add `_pv` parameter to strategy_comparison.ipynb
+
+**What:** Added optional `_pv` (use_pvalue_weights) parameter parsing to `strategy_comparison.ipynb`.
+
+**Why:** `strategy.ipynb` now appends `_pv{True/False}` to filenames when saving results. The comparison notebook's `_PARAM_RE` regex didn't include this token, causing any `_pv`-suffixed files to silently fail parsing and be skipped with a WARNING.
+
+**Changes:**
+- Added `(?:_pv(?P<pv>[^_]+))?` as an optional group in `_PARAM_RE` (between `_cb` and the start date)
+- Added `"pv": d.get("pv")` to `_parse_params` return dict (returns `None` for old files without the param)
+- Added `"pv": "pv"` to `PARAM_DISPLAY` so it appears in labels when it differs across runs
+
+---
+
+## 2026-03-10 — Parallelize formation_search.py with ProcessPoolExecutor
+
+**Change:** Replaced the sequential combo loop in `scripts/formation_search.py` with `ProcessPoolExecutor`. Added `--workers` CLI arg (default: `os.cpu_count()`).
+
+**macOS-specific design:** macOS uses the "spawn" multiprocessing start method (not "fork"), which means worker processes cannot inherit parent memory. All module-level imports re-run in each worker. Two consequences:
+1. Worker functions must be defined at module level (top-level picklable callables) — `_eval_combo_worker` and `_init_worker` added.
+2. `price_cache` is sent to each worker once via the `initializer=` argument to `ProcessPoolExecutor`, not re-pickled per task. This avoids N_tasks × cache_size pickle overhead.
+
+**Progress reporting:** Uses `as_completed()` so results print as they finish (out of submission order, but tagged with combo index).
+
+**`if __name__ == "__main__"` guard** was already present — required on macOS so spawned workers don't re-invoke `main()`.
+
+---
+
+## 2026-03-09 — Fix position sizing bug (B leg oversized by price_b/price_a)
+
+**Bug:** `shares_b = hedge_ratio * shares_a = hedge_ratio * notional / price_a`. This divides by `price_a` instead of `price_b`, oversizing leg B by a factor of `price_b / price_a`. For low-price/high-price pairs (e.g. F ~$10 vs COST ~$980), leg B was ~95× too large.
+
+**Symptom:** F/COST pair created $9,437 COST shares (~$9.3M notional) from a $50k notional budget. Produced $219k and $89k gross P&L outliers in Dec 2024.
+
+**Root cause:** β is a log-price OLS coefficient — not a dollar hedge ratio. Dollar-neutral sizing requires `shares_b = β × notional / price_b`, not `β × notional / price_a`.
+
+**Fix:** [strategy/backtester.py](strategy/backtester.py) line 650: `shares_b = hedge_ratio * notional_per_pair / entry_price_b`. Also corrected the docstring.
+
+**Tests added** (`TestPositionSizing` in [tests/test_backtester.py](tests/test_backtester.py)): leg A notional == notional_per_pair; |leg B notional| == |β| * notional_per_pair; regression test with price_a=$10/price_b=$1000; invariance to price ratio; negative hedge_ratio sign check. Key infra: must also patch `strategy.backtester.get_all_tickers` to return `["A","B"]` so synthetic tickers reach `_price_cache`.
+
+---
+
 ## 2026-03-09 — Config-driven run_backtest + require_split_window
 
 **Motivation:** `run_backtest` had an ever-growing explicit parameter list. Any new cointegration or signal tunable required a signature change. Solution: collapse all parameters into a single `Config` instance; `run_backtest` now takes only `config: Config | None = None`.
@@ -777,4 +818,178 @@ Discovered that strategy.ipynb overrides config.py with different parameters:
 - The actual strategy config matches C2 in the experiment (z_entry=4, z_exit=2.5, z_stop=5, max_hold=300)
 - C1 "Baseline" in experiments was wrong — it reflected config.py defaults, not what the strategy actually runs
 - disconnect_analysis.md updated with a correction section at the top
+
+
+## 2026-03-11: Fix three performance bugs in grid_search_v2.py _eval_combo
+
+### What changed
+**File:** `scripts/grid_search_v2.py`
+
+1. **`_init_worker`**: Added `os.environ["POLARS_MAX_THREADS"] = "1"` before setting worker globals. Without this, each of N worker processes spawns its own rayon thread pool (~8 threads each), so N workers × 8 threads = ~80 threads compete on ~14 cores causing massive context-switch overhead (confirmed by 795/2216 `sample` stack frames in `pthread_cond_wait` inside `rechunk_mut_par`).
+
+2. **`_eval_combo` day_prices filter**: Changed `pl.col("timestamp").dt.date() >= lookback_start` (Python `date` object) to `pl.col("timestamp").dt.date() >= pl.lit(lookback_start)`. Without `pl.lit()`, Polars falls back to row-by-row Python object conversion which was consuming 862/2216 profiling samples in `datetime_to_py_object`.
+
+3. **Double filter eliminated**: The old dict comprehension applied `df.filter(...)` twice per ticker per date — once in the comprehension value and once in the `if len(df.filter(...)) > 0` guard. Replaced with an explicit loop that filters once and reuses the result.
+
+### Why
+Profiling via macOS `sample` on a 27-hour-old stuck run revealed these as the top two hotspots. The current run cannot benefit (workers already initialized), so user should kill and restart.
+
+## 2026-03-11: Add incremental checkpointing to grid_search_v2.py
+
+### What changed
+**File:** `scripts/grid_search_v2.py`
+
+- `output_path = Path(args.output)` moved earlier (before the formation loop) so checkpoint_dir can be derived from it.
+- `checkpoint_dir` = `{output_stem}_checkpoints/` sibling directory created at startup.
+- Per formation combo, a checkpoint parquet is written with a descriptive name (rolling window, half-life range, p-value, index).
+- Inside the `as_completed` loop, checkpoint is overwritten every 25 completed signal combos so partial results survive a crash.
+- Final checkpoint written after each formation combo's pool exits.
+- Final merged output still written unchanged at the end from `all_results`.
+- Removed duplicate `output_path = Path(args.output)` that was previously at the bottom of main().
+
+### Why
+The grid search runs for many hours; without checkpoints any crash loses all progress. Each formation combo's checkpoint file is a self-contained parquet loadable for analysis while the run is in flight.
+
+## 2026-03-11: Add timestamped logging to grid_search_v2.py
+
+### What changed
+**File:** `scripts/grid_search_v2.py`
+
+- Added `import time`, `from datetime import datetime`, `from typing import TextIO` to imports.
+- Added module-level `_log_fh: TextIO | None` and `_log(msg)` function: stamps every message with `[YYYY-MM-DD HH:MM:SS]`, prints to stdout, and flushes to the log file if open.
+- Added `_fmt_duration(seconds) -> str` helper for HH:MM:SS formatting.
+- `main()` opens `{output_stem}.log` in append mode before calling `_run()`, closes it in a `finally` block. Append mode means successive runs accumulate in one log file.
+- Extracted all post-output_path logic into `_run()` so the try/finally in `main()` cleanly wraps everything.
+- All `print()` calls replaced with `_log()` throughout `_run()` and `_send_completion_imessage()`.
+- Added `run_start` and `sweep_start` monotonic timers; each checkpoint line now shows `elapsed HH:MM:SS | ETA ~HH:MM:SS` so it's easy to read progress from the log timestamps alone.
+- Final save line includes total wall-clock duration.
+
+### Why
+Grid search runs many hours with no console feedback between checkpoints; log file + timestamps make it easy to check progress and estimate completion time without being at the terminal.
+
+## 2026-03-11: Write README.md
+
+### What changed
+**File:** `README.md` (new)
+
+### Why
+Added top-level README covering the full pipeline: data fetching via EODHD, preprocessing, formation search, grid search, backtest via notebook or debug.py, and results directory layout. Includes setup instructions, env var config (EODHD_KEY, NOTIFY_IMESSAGE_TO), and pointer to final_report.ipynb. All commands use `uv run python -m` to match the pyproject.toml build setup.
+
+## 2026-03-12 — Added exit reason analysis to strategy_comparison.ipynb
+
+Added two new cells after the Drawdown plot in `notebooks/strategy_comparison.ipynb`:
+
+1. **Summary table** (`exit_df`): groups trades by `(Strategy, exit_reason)` and shows count, % of trades, total gross P&L, total net P&L, avg gross/net per trade, and win rate. Rendered via `pandas Styler` with formatted columns.
+
+2. **Bar chart** (side-by-side): two subplots — one for gross P&L by exit reason, one for net P&L — with one bar group per strategy, so cost impact is immediately visible across `z_exit`, `z_stop`, and `max_hold`.
+
+Motivation: user requested an explicit breakdown of exit reasons including total gross and net P&L, which makes it easy to see which exit type drives the large cost drag in the `cb=3.0` run.
+
+## 2026-03-12 — Reordered exit reason table index
+
+Changed the multi-index in the exit reason table from `(Strategy, Exit Reason)` to `(Exit Reason, Strategy)` so all strategies appear side-by-side under each exit reason, making cross-strategy comparison easier. Also updated the chart's `loc` lookup to match the new index order `(reason, lbl)`.
+
+## 2026-03-12 — Added formation group filter to grid_search_v2.ipynb
+
+Inserted two cells after the data load cell (cell-2):
+1. Markdown explaining the filter feature
+2. Code cell that:
+   - Defines `FORMATION_PARAMS` = the 4 pair-selection columns
+   - Prints a table of all available formation combos (with index) for easy reference
+   - Exposes `FORMATION_FILTER` dict — user sets this to a specific combo or leaves it `None` for all
+   - Re-assigns `df` filtered to that combo so all downstream cells (IC distributions, top combos, heatmaps, etc.) automatically reflect the selection without any further changes
+   - Sets `FORMATION_LABEL` for potential use in chart titles
+
+No other cells were modified. The pattern (narrow df early, everything else just works) avoids duplicating any analysis logic.
+
+## 2026-03-12 — Updated IS/OOS periods in final_plan.md
+
+Changed A2 and Sections 8/9 to reflect the correct split:
+- IS: 2017-2019 (matches actual param fitting: formation on 2017-2018, signals on 2019)
+- OOS: 2020-2024 (5 years; 2020 included but flagged explicitly as COVID stress year)
+- Extended OOS: 2025-01-01 through 2026-02-28 (recent history)
+Also aligned A1 ablation to use 2019 (IS period) rather than 2021-2024.
+
+## 2026-03-12 — Updated benchmark approach in final_plan.md
+
+Changed A6 and Section 2 from equal-weight long-only to:
+- Primary benchmark: risk-free rate (max 3-month T-bill over full period — conservative single constant)
+- Market neutrality check: SPY beta regression (beta, alpha, correlation) to validate benchmark choice
+- SPY shown alongside equity curve for regime context only, not as performance comparison
+Rationale: long-only benchmarks are inappropriate for dollar-neutral market-neutral strategies.
+
+## 2026-03-12 — Created scripts/fetch_spy.py
+
+New standalone script to fetch daily adjusted SPY prices from EODHD.
+Saves to data/benchmark/spy_daily.parquet (separate from data/raw/ universe data).
+Reuses EODHD_KEY env var and CONFIG.api.base_url from utils/config.py but does not import fetch_data.py — intentionally kept independent so it can be run without touching the universe pipeline.
+Columns: date, open, high, low, close, adjusted_close, volume.
+Defaults to 2017-01-01 → 2026-02-28 to cover IS + OOS + extended OOS.
+--force flag to overwrite; otherwise skips if file already exists.
+
+## 2026-03-12 — Implemented A3: p-value weighted position sizing
+
+Added `use_pvalue_weights: bool = False` to `PortfolioConfig` in `utils/config.py`.
+In `strategy/backtester.py`:
+- Read `use_pvalue_weights` from config at top of `run_backtest()`
+- At SOD: if enabled, sort pairs by p_value ascending, take top max_pairs, compute weights as `-log(p_value)` normalized to sum to 1, store as `_pair_notionals` dict keyed by (ticker_a, ticker_b)
+- At entry: look up pair's notional from dict (fallback to equal notional_per_pair if not found)
+
+Design: -log(p) avoids explosion for very small p-values; normalizing over top max_pairs (not all pairs) ensures total notional = portfolio_value when all slots fill, consistent with equal-weight baseline.
+
+## 2026-03-12 — Created scripts/fetch_tbill.py (A6 benchmark)
+
+Added yfinance as a dependency (uv add yfinance). Fetches ^IRX (CBOE 13-Week Treasury Bill index) from Yahoo Finance — annualised yield in %, no API key required. Saves to data/benchmark/tbill_3m_daily.parquet (same benchmark dir as spy_daily.parquet). Outputs max yield as a convenience since the plan uses peak rate as the conservative Sharpe hurdle. 2017-2026 gives max of ~5.35%.
+
+Tried pandas_datareader (FRED) first but it's broken on pandas 3.0 (deprecate_kwarg API change). yfinance ^IRX is equivalent data (13-week T-bill yield) and has no auth requirement.
+
+## 2026-03-12: Built notebooks/final_report.ipynb
+
+Created `scripts/build_final_report.py` — a builder script that programmatically generates the final report notebook using Python's json library. This avoids JSON escaping issues that would arise from writing the notebook as raw JSON.
+
+The notebook has 53 cells (24 code, 29 markdown) covering all 12 sections mapped to the 10 rubric criteria:
+- Section 0: Setup — imports, file paths, helper functions (sharpe, max_dd, summary_stats, load_portfolio, load_trades)
+- Section 1: Strategy overview + hypothesis table (H1–H7)
+- Section 2: Benchmarks — T-bill max yield, SPY beta regression, equity curve with regime overlay
+- Section 3: Data description — sector composition bar chart, coverage table
+- Section 4: Formation indicator analysis — mean_n_pairs vs window, composite score heatmap
+- Section 5: Signal process analysis — IC histogram, IC t-stat vs z_entry, hit rate, breakeven bps
+- Section 6: Rule ablation — 4 configs overlaid equity curves + summary stats table
+- Section 7: Parameter optimization — formation heatmap, signal IC heatmap, zscore_window sensitivity
+- Section 8: Walk-forward analysis — IS/OOS/Extended split, equity curve with dividers
+- Section 9: Overfitting assessment — Sharpe comparison bar chart, parameter stability
+- Section 10: Full backtest results — 3-panel equity curve, trade stats, monthly returns heatmap
+- Section 11: Extensions — p-value weighting illustration, Mahalanobis + Kalman conceptual descriptions
+- Section 12: Conclusions — hypothesis results table, key findings, limitations, future work
+
+Key data mappings used:
+- IS/OOS split from single full-period file: daily_pnl_..._mp20_mh9999_mbr8_cb3_2017-01-01_2026-02-28.parquet
+- Ablation: 4 IS-period files (zs=999/6/6/6, mh=9999/9999/9999/120)
+- Benchmark: data/benchmark/tbill_3m_daily.parquet + spy_daily.parquet
+- Formation: results/formation_search.parquet (81 rows)
+- Signal: results/grid_search_v2.parquet (2916 rows)
+
+Bug fixed: 
+ in triple-quoted builder strings was expanded to literal newlines inside set_title() calls, causing SyntaxError. Fixed by removing 
+ from those specific title strings.
+
+
+## 2026-03-12: Expanded Section 1 of final_report.ipynb with content from strategy_summary.ipynb
+
+Replaced the lean Section 1 overview with rich content from strategy_summary.ipynb, adapted to match the actual work done:
+
+1. Introduction paragraph (adapted: 154 tickers/8 sector groups, 15-min bars, correct params)
+2. Point 1: Cointegration-based pair selection (adapted: half-life 2-24 bars = 30min-6h, 42-day window)
+3. Point 2: Z-score signal generation (adapted: z_entry=3.0, z_exit=2.25, z_stop=6.0, 5-day rolling window)
+4. Point 3: Market-neutral position construction (adapted: 20 pairs, $1M capital, 3 bps/leg)
+5. Point 4: Intraday implementation (adapted: 15-min resampled, 154 tickers, 8 sector groups)
+6. Hypothesis Testing Framework — full H₀/H₁/Test/Metrics/Expected for H1-H7 (adapted to actual work)
+7. Hypothesis cross-reference summary code cell (updated metrics to match actual tests)
+8. Literature Review — 6 papers across 3 subsections:
+   - Foundational: Engle & Granger (1987), Elliott et al. (2005)
+   - Pairs strategies: Gatev et al. (2006), Do & Faff (2010), Do & Faff (2012)
+   - Cointegration methods: Avellaneda & Lee (2010), Caldeira & Moura (2013), Alexander & Dimitriu (2005)
+
+Notebook grew from 53 to 63 cells (24 code, 39 markdown).
+Key adaptations from strategy_summary: removed references to old H5/H8 hypotheses, updated all parameter values, replaced '11 GICS sectors' with '8 sector groups', updated breakeven discussion to reflect 3 bps vs 15-20 bps historical benchmark.
 
